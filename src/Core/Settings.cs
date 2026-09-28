@@ -18,7 +18,9 @@ namespace LiteMonitor
         public Point Position { get; set; } = new Point(-1, -1);
 
         // ====== 界面与行为 ======
-        public bool AutoCheckUpdate { get; set; } = true; // ★★★ [新增] 自动检查更新 ★★★
+        // 私人维护分支默认关闭：上游一旦发新版，自动更新会用官方包整目录覆盖本地构建。
+        // 关闭后启动时不联网查版本；右键菜单/关于页里的手动检查仍可用。
+        public bool AutoCheckUpdate { get; set; } = false;
         public bool HorizontalMode { get; set; } = false;
         public double Opacity { get; set; } = 0.85;
         public string Language { get; set; } = "";

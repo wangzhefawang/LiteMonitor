@@ -345,7 +345,9 @@ namespace LiteMonitor.src.UI.Helpers
             try
             {
                 if (HardwareMonitor.Instance != null) await HardwareMonitor.Instance.SmartCheckDriver();
-                await UpdateChecker.CheckAsync();
+                // 开关关闭时完全不联网。原逻辑是先请求 version.json 再决定是否弹窗，
+                // 结果菜单里仍会出现"发现新版本"入口，误点就会被官方包覆盖。
+                if (_cfg.AutoCheckUpdate) await UpdateChecker.CheckAsync();
                 CheckUpdateSuccess();
 
                 // 如果发现新版本，重新构建菜单以显示“发现新版本”按钮
