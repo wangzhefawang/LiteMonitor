@@ -134,7 +134,7 @@ namespace LiteMonitor
             UIUtils.ScaleFactor = this.DeviceDpi / 96f;
 
             TrafficLogger.Load();
-            HardwareHistoryLogger.Load();
+            _ = HardwareHistoryLogger.LoadAsync(); // 后台加载，不阻塞窗口创建
             src.Plugins.PluginManager.Instance.LoadPlugins(Path.Combine(AppContext.BaseDirectory, "resources", "plugins"));
             src.Plugins.PluginManager.Instance.Start();
             _ui = new UIController(_cfg, this);

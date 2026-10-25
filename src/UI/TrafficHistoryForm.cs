@@ -311,8 +311,8 @@ namespace LiteMonitor
         private void LoadGridData(HistoryViewMode mode)
         {
             _grid.Rows.Clear();
-            var raw = TrafficLogger.Data.History;
-            if (raw == null || raw.Count == 0)
+            var raw = TrafficLogger.GetHistorySnapshot();
+            if (raw.Count == 0)
             {
                 _lblListSummary.Text = "暂无历史数据 (No Data)";
                 return;
@@ -322,7 +322,8 @@ namespace LiteMonitor
             long maxTotal = list.Any() ? list.Max(x => x.Total) : 1;
             if (maxTotal == 0) maxTotal = 1;
 
-            double avg = list.Average(x => x.Total);
+            // 日期键都无法解析时 list 为空，Average 会抛异常
+            double avg = list.Count > 0 ? list.Average(x => x.Total) : 0;
             double threshold = Math.Max(avg * 2.0, 1024.0 * 1024 * 1024);
 
             long sumUp = 0, sumDown = 0;
@@ -396,8 +397,16 @@ namespace LiteMonitor
                             float pctUp = total > 0 ? (float)up / total : 0;
                             int wUp = (int)(wTotal * pctUp);
                             int wDown = wTotal - wUp;
-                            if (wUp > 0) e.Graphics.FillRectangle(new SolidBrush(C_Up), new Rectangle(r.X, r.Y, wUp, r.Height));
-                            if (wDown > 0) e.Graphics.FillRectangle(new SolidBrush(C_Down), new Rectangle(r.X + wUp, r.Y, wDown, r.Height));
+                            if (wUp > 0)
+                            {
+                                using var brushUp = new SolidBrush(C_Up);
+                                e.Graphics.FillRectangle(brushUp, new Rectangle(r.X, r.Y, wUp, r.Height));
+                            }
+                            if (wDown > 0)
+                            {
+                                using var brushDown = new SolidBrush(C_Down);
+                                e.Graphics.FillRectangle(brushDown, new Rectangle(r.X + wUp, r.Y, wDown, r.Height));
+                            }
                         }
                     }
                 }

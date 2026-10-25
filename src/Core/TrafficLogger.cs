@@ -189,6 +189,15 @@ namespace LiteMonitor.src.Core
             return (0, 0);
         }
 
+        // 获取历史记录的快照 (供 UI 枚举，避免与 AddTraffic 并发修改同一个 Dictionary)
+        public static Dictionary<string, DailyRecord> GetHistorySnapshot()
+        {
+            lock (_dataLock)
+            {
+                return CloneDataUnsafe().History;
+            }
+        }
+
         // [新增] 删除指定日期的记录
         public static void RemoveRecord(string dateKey)
         {
