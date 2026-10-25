@@ -7,30 +7,36 @@ using System.Text.Json;
 using System.Buffers;
 using System.Diagnostics;
 using LiteMonitor.src.Core;
+using LiteMonitor.src.SystemServices;
 
 namespace LiteMonitor.src.WebServer
 {
     public class WebSessionManager
     {
+        // 同时处理的连接上限；WebSocket 客户端在整个 ReceiveLoop 期间都占一个名额
+        private const int MaxConnections = 32;
+        // 初始请求头的读取超时（毫秒）
+        private const int HeaderReadTimeoutMs = 5000;
+
         private readonly ConcurrentDictionary<TcpClient, bool> _wsClients = new();
         private readonly Action<Utf8JsonWriter> _dataProvider;
-        private volatile bool _isRunning = false;
+        private readonly SemaphoreSlim _connSlots = new(MaxConnections, MaxConnections);
 
         public WebSessionManager(Action<Utf8JsonWriter> dataProvider)
         {
             _dataProvider = dataProvider;
         }
 
-        public void Start()
+        /// <summary>
+        /// 启动广播循环。循环的生命周期完全由 token 决定，Stop 之后旧循环会自行退出。
+        /// </summary>
+        public void Start(CancellationToken token)
         {
-            if (_isRunning) return;
-            _isRunning = true;
-            Task.Run(BroadcastLoop);
+            Task.Run(() => BroadcastLoop(token));
         }
 
         public void Stop()
         {
-            _isRunning = false;
             foreach (var client in _wsClients.Keys)
             {
                 try { client.Close(); } catch { }
@@ -41,18 +47,24 @@ namespace LiteMonitor.src.WebServer
         /// <summary>
         /// 统一处理客户端连接（自动识别 WebSocket 或 HTTP）
         /// </summary>
-        public async Task HandleClientAsync(TcpClient client)
+        public async Task HandleClientAsync(TcpClient client, CancellationToken serviceToken)
         {
+            // 超过连接上限直接关闭，不排队
+            if (!_connSlots.Wait(0))
+            {
+                try { client.Close(); } catch { }
+                return;
+            }
+
             byte[] buffer = null;
             try
             {
                 var stream = client.GetStream();
-                stream.ReadTimeout = 5000; // 防恶意连接
 
-                // 1. 读取请求头 (最多 8KB)
+                // 1. 读取请求头 (最多 8KB，5 秒内没读完就放弃，防恶意连接)
                 buffer = ArrayPool<byte>.Shared.Rent(8192);
-                int bytesRead = await ReadHeaderAsync(stream, buffer);
-                
+                int bytesRead = await ReadHeaderAsync(stream, buffer, serviceToken);
+
                 if (bytesRead == 0) { client.Close(); return; }
 
                 string requestStr = Encoding.UTF8.GetString(buffer, 0, bytesRead);
@@ -63,7 +75,7 @@ namespace LiteMonitor.src.WebServer
                     if (Handshake(stream, requestStr))
                     {
                         _wsClients.TryAdd(client, true);
-                        await ReceiveLoop(client); // 进入 WS 循环
+                        await ReceiveLoop(client, serviceToken); // 进入 WS 循环
                     }
                 }
                 else
@@ -71,6 +83,11 @@ namespace LiteMonitor.src.WebServer
                     HandleHttpRequest(stream, requestStr);
                     client.Close(); // HTTP 是短连接
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                // 请求头读取超时或服务停止，属于预期情况，直接关闭连接，不记日志
+                try { client.Close(); } catch { }
             }
             catch (Exception ex)
             {
@@ -80,20 +97,25 @@ namespace LiteMonitor.src.WebServer
             finally
             {
                 if (buffer != null) ArrayPool<byte>.Shared.Return(buffer);
+                _connSlots.Release(); // 与方法开头的 Wait(0) 成对，只释放一次
             }
         }
 
         // --- 内部网络辅助方法 ---
 
-        private async Task<int> ReadHeaderAsync(NetworkStream stream, byte[] buffer)
+        private async Task<int> ReadHeaderAsync(NetworkStream stream, byte[] buffer, CancellationToken serviceToken)
         {
+            // NetworkStream.ReadTimeout 对 ReadAsync 无效，用链接 token 实现整个请求头的 5 秒总超时
+            using var readCts = CancellationTokenSource.CreateLinkedTokenSource(serviceToken);
+            readCts.CancelAfter(HeaderReadTimeoutMs);
+
             int totalBytes = 0;
             while (totalBytes < buffer.Length)
             {
                 // 预留空间检查
                 if (totalBytes >= buffer.Length) break;
 
-                int read = await stream.ReadAsync(buffer, totalBytes, buffer.Length - totalBytes);
+                int read = await stream.ReadAsync(buffer.AsMemory(totalBytes, buffer.Length - totalBytes), readCts.Token);
                 if (read == 0) break;
                 
                 totalBytes += read;
@@ -182,31 +204,29 @@ namespace LiteMonitor.src.WebServer
 
         // --- WebSocket 核心逻辑 ---
 
-        private async Task BroadcastLoop()
+        private async Task BroadcastLoop(CancellationToken token)
         {
-            while (_isRunning)
+            // 本循环独有的快照缓冲，容量不够时自动扩容；每个循环实例各持一份，旧循环退出时不会和新循环共用
+            var json = new ArrayBufferWriter<byte>(32 * 1024);
+
+            while (!token.IsCancellationRequested)
             {
                 // [Optimization] 如果没有任何客户端连接，降低循环频率以节省资源
                 if (_wsClients.IsEmpty)
                 {
-                    await Task.Delay(2000);
+                    try { await Task.Delay(2000, token); } catch (OperationCanceledException) { break; }
                     continue;
                 }
 
-                byte[] buffer = null;
                 try
                 {
-
-                    buffer = ArrayPool<byte>.Shared.Rent(32 * 1024); 
-                    
-                    int payloadLen;
-                    using (var ms = new System.IO.MemoryStream(buffer))
-                    using (var writer = new Utf8JsonWriter(ms))
+                    json.ResetWrittenCount();
+                    using (var writer = new Utf8JsonWriter(json))
                     {
                         _dataProvider(writer);
                         writer.Flush();
-                        payloadLen = (int)ms.Position;
                     }
+                    int payloadLen = json.WrittenCount;
 
                     int headerLen = 2;
                     if (payloadLen >= 65536) headerLen += 8;
@@ -218,11 +238,7 @@ namespace LiteMonitor.src.WebServer
                     try
                     {
                         int payloadOffset = EncodeFrameHeader(payloadLen, frameBuffer);
-                        Buffer.BlockCopy(buffer, 0, frameBuffer, payloadOffset, payloadLen);
-
-                        // Now we can return the "JSON Scratchpad" buffer IMMEDIATELY!
-                        ArrayPool<byte>.Shared.Return(buffer);
-                        buffer = null; // Prevent double return in finally
+                        json.WrittenSpan.CopyTo(frameBuffer.AsSpan(payloadOffset));
 
                         // Broadcast using frameBuffer
                         var tasks = new List<Task>();
@@ -254,15 +270,11 @@ namespace LiteMonitor.src.WebServer
                 }
                 catch (Exception ex)
                 {
-                    Debug.WriteLine($"Broadcast Error: {ex.Message}");
-                }
-                finally
-                {
-                    if (buffer != null) ArrayPool<byte>.Shared.Return(buffer);
+                    AppLog.Warn("Web.Broadcast", "快照广播失败", ex);
                 }
 
                 // 正常广播频率：每秒一次
-                await Task.Delay(1000);
+                try { await Task.Delay(1000, token); } catch (OperationCanceledException) { break; }
             }
         }
 
@@ -315,7 +327,7 @@ namespace LiteMonitor.src.WebServer
         }
 
 
-        private async Task ReceiveLoop(TcpClient client)
+        private async Task ReceiveLoop(TcpClient client, CancellationToken serviceToken)
         {
             byte[] buffer = null;
             try
@@ -326,8 +338,8 @@ namespace LiteMonitor.src.WebServer
 
                 while (client.Connected && _wsClients.ContainsKey(client))
                 {
-                    // 阻塞读取，如果断开会抛出异常或返回0
-                    int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+                    // 阻塞读取，如果断开会抛出异常或返回0；服务停止时 token 取消会让它抛出 OperationCanceledException
+                    int bytesRead = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), serviceToken);
                     if (bytesRead == 0) break; // 客户端关闭连接
 
                     // 解析帧头判断是否为 Close 帧 (OpCode = 8)

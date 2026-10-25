@@ -14,6 +14,8 @@ namespace LiteMonitor.src.WebServer
     public class LiteWebServer : IDisposable
     {
         private TcpListener? _listener;
+        // 每次 Start 新建一个，Stop 时 Cancel；旧循环只看自己那一份 token，不会和新循环混在一起
+        private CancellationTokenSource? _cts;
         private volatile bool _isRunning = false;
         private int _currentRunningPort = -1;
 
@@ -65,11 +67,15 @@ namespace LiteMonitor.src.WebServer
                 _currentRunningPort = port;
                 CurrentPassword = _cfg.WebServerPassword;
 
-                // 1. 启动监听连接的循环
-                Task.Run(ListenLoop);
-                
+                _cts = new CancellationTokenSource();
+                var token = _cts.Token;
+                var listener = _listener;
+
+                // 1. 启动监听连接的循环（循环持有自己的 listener 和 token，不读字段）
+                Task.Run(() => ListenLoop(listener, token));
+
                 // 2. 启动 WebSocket 管理器 (广播循环在内部)
-                _sessionManager.Start();
+                _sessionManager.Start(token);
                 
                 return true;
             }
@@ -85,6 +91,9 @@ namespace LiteMonitor.src.WebServer
         {
             _isRunning = false;
             _currentRunningPort = -1;
+            // 先通知所有循环退出；不 Dispose，循环可能还在读 token
+            _cts?.Cancel();
+            _cts = null;
             try { _listener?.Stop(); } catch { }
             
             // 停止 WebSocket 管理器
@@ -96,18 +105,23 @@ namespace LiteMonitor.src.WebServer
             Stop();
         }
 
-        private async Task ListenLoop()
+        private async Task ListenLoop(TcpListener listener, CancellationToken token)
         {
-            while (_isRunning && _listener != null)
+            while (!token.IsCancellationRequested)
             {
                 try
                 {
-                    var client = await _listener.AcceptTcpClientAsync();
+                    var client = await listener.AcceptTcpClientAsync(token);
                     // [Refactor] All connection handling logic moved to WebSessionManager (now serving as unified ConnectionManager)
-                    _ = _sessionManager.HandleClientAsync(client);
+                    _ = _sessionManager.HandleClientAsync(client, token);
                 }
+                catch (OperationCanceledException) { break; }
                 catch (ObjectDisposedException) { break; }
-                catch (Exception ex) { Debug.WriteLine(ex.Message); }
+                catch (Exception ex)
+                {
+                    AppLog.Warn("Web.Listen", "接受连接失败", ex);
+                    if (token.IsCancellationRequested) break;
+                }
             }
         }
 
@@ -121,27 +135,24 @@ namespace LiteMonitor.src.WebServer
                 return;
             }
 
-            // ★★★ 修复：创建列表副本并加锁，防止遍历时 UI 线程修改集合导致崩溃 ★★★
-            List<MonitorItemConfig> itemsCopy;
+            // MonitorItems 是写时复制的：写入方替换引用，已发布的列表不会再被修改，所以这里只读一次引用，不需要加锁
+            var items = _cfg.MonitorItems;
             Dictionary<string, int> groupIndices = new Dictionary<string, int>();
-            
-            lock (_cfg.MonitorItems)
-            {
-                // ★★★ 修复：复用主界面 (Panel模式) 的排序逻辑 ★★★
-                itemsCopy = _cfg.MonitorItems
-                    .GroupBy(x => x.UIGroup)
-                    .OrderBy(g => g.Min(x => x.SortIndex))
-                    .SelectMany(g => g.OrderBy(x => x.SortIndex))
-                    .ToList();
 
-                // 预计算组顺序索引 (基于排序后的列表)
-                int gIdx = 0;
-                foreach(var item in itemsCopy)
+            // ★★★ 修复：复用主界面 (Panel模式) 的排序逻辑 ★★★
+            var itemsCopy = items
+                .GroupBy(x => x.UIGroup)
+                .OrderBy(g => g.Min(x => x.SortIndex))
+                .SelectMany(g => g.OrderBy(x => x.SortIndex))
+                .ToList();
+
+            // 预计算组顺序索引 (基于排序后的列表)
+            int gIdx = 0;
+            foreach(var item in itemsCopy)
+            {
+                if (!groupIndices.ContainsKey(item.UIGroup))
                 {
-                    if (!groupIndices.ContainsKey(item.UIGroup))
-                    {
-                        groupIndices[item.UIGroup] = gIdx++;
-                    }
+                    groupIndices[item.UIGroup] = gIdx++;
                 }
             }
 
