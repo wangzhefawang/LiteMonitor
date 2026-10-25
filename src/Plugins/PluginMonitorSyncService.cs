@@ -36,121 +36,125 @@ namespace LiteMonitor.src.Plugins
             var targets = inst.Targets != null && inst.Targets.Count > 0 ? inst.Targets : new List<Dictionary<string, string>> { new Dictionary<string, string>() };
             var validKeys = new HashSet<string>();
 
-            // 优化 2: 高风险并发崩溃修复 - 加锁
-            lock (settings.MonitorItems)
+            // 规则：运行期不得原地增删已发布的 MonitorItems 列表，复制后整体替换（其他线程可能正在枚举它）
+            // 已存在项的属性（SortIndex、DynamicLabel 等）仍在共享对象上原地修改
+            var items = new List<MonitorItemConfig>(settings.MonitorItems);
+            bool structureChanged = false;
+
+            for (int i = 0; i < targets.Count; i++)
             {
-                for (int i = 0; i < targets.Count; i++)
+                var targetInputs = targets[i];
+                var mergedInputs = new Dictionary<string, string>(inst.InputValues);
+
+                // Merge Target Inputs
+                foreach (var kv in targetInputs) mergedInputs[kv.Key] = kv.Value;
+
+                // Apply Defaults
+                if (tmpl.Inputs != null)
                 {
-                    // ... (保持原有循环逻辑，但被锁保护)
-                    var targetInputs = targets[i];
-                    var mergedInputs = new Dictionary<string, string>(inst.InputValues);
-                    
-                    // Merge Target Inputs
-                    foreach (var kv in targetInputs) mergedInputs[kv.Key] = kv.Value;
-
-                    // Apply Defaults
-                    if (tmpl.Inputs != null)
+                    foreach (var input in tmpl.Inputs)
                     {
-                        foreach (var input in tmpl.Inputs)
+                        if (input.DefaultValue != null && (!mergedInputs.ContainsKey(input.Key) || string.IsNullOrEmpty(mergedInputs[input.Key])))
                         {
-                            if (input.DefaultValue != null && (!mergedInputs.ContainsKey(input.Key) || string.IsNullOrEmpty(mergedInputs[input.Key])))
-                            {
-                                mergedInputs[input.Key] = input.DefaultValue;
-                            }
-                        }
-                    }
-
-                    string keySuffix = (inst.Targets != null && inst.Targets.Count > 0) ? $".{i}" : "";
-
-                    if (tmpl.Outputs != null)
-                    {
-                        foreach (var output in tmpl.Outputs)
-                        {
-                            string itemKey = PluginConstants.DASH_PREFIX + inst.Id + keySuffix + "." + output.Key;
-                            validKeys.Add(itemKey);
-
-                            // 注入 Loading 状态 (仅当当前无值时)
-                            if (string.IsNullOrEmpty(InfoService.Instance.GetValue(itemKey)))
-                            {
-                                InfoService.Instance.InjectValue(itemKey, PluginConstants.STATUS_LOADING);
-                            }
-                            // ★★★ [新增] 顺便注入默认单位，这样 MetricUtils 就能查到了 ★★★
-                            InfoService.Instance.InjectValue(itemKey + ".Unit", output.Unit);
-
-                            var item = settings.MonitorItems.FirstOrDefault(x => x.Key == itemKey);
-
-                            string labelPattern = output.Label;
-                            if (string.IsNullOrEmpty(labelPattern)) labelPattern = (tmpl.Meta.Name) + " " + output.Key;
-
-                            string finalName = PluginProcessor.ResolveTemplate(labelPattern, mergedInputs);
-                            string finalShort = PluginProcessor.ResolveTemplate(output.ShortLabel, mergedInputs);
-
-                            if (item == null)
-                            {
-                                // Create New Item
-                                string safeLabel = !string.IsNullOrEmpty(finalName) ? finalName : (tmpl.Meta.Name + " " + output.Key);
-                                string safeShort = !string.IsNullOrEmpty(finalShort) ? finalShort : output.Key;
-
-                                // [Optimization] Smart Insert: Follow last sibling based on SortIndex
-                                string prefix = PluginConstants.DASH_PREFIX + inst.Id + ".";
-                                var siblings = settings.MonitorItems.Where(x => x.Key.StartsWith(prefix)).ToList();
-                                
-                                var lastSortPeer = siblings.OrderByDescending(x => x.SortIndex).FirstOrDefault();
-                                var lastTbSortPeer = siblings.OrderByDescending(x => x.TaskbarSortIndex).FirstOrDefault();
-                                
-                                int nextSort = (lastSortPeer?.SortIndex ?? (settings.MonitorItems.Any() ? settings.MonitorItems.Max(x => x.SortIndex) : 0)) + 1;
-                                int nextTbSort = (lastTbSortPeer?.TaskbarSortIndex ?? (settings.MonitorItems.Any() ? settings.MonitorItems.Max(x => x.TaskbarSortIndex) : 0)) + 1;
-
-                                // Shift others to make room
-                                foreach (var m in settings.MonitorItems)
-                                {
-                                    if (m.SortIndex >= nextSort) m.SortIndex++;
-                                    if (m.TaskbarSortIndex >= nextTbSort) m.TaskbarSortIndex++;
-                                }
-
-                                item = new MonitorItemConfig
-                                {
-                                    Key = itemKey,
-                                    UserLabel = "", // Auto mode
-                                    DynamicLabel = safeLabel,
-                                    TaskbarLabel = "", // Auto mode
-                                    DynamicTaskbarLabel = safeShort,
-                                    UnitPanel = output.Unit,
-                                    UnitTaskbar = output.Unit, // [Fix] Sync Unit to Taskbar as well
-                                    VisibleInPanel = true,
-                                    SortIndex = nextSort,
-                                    TaskbarSortIndex = nextTbSort,
-                                };
-                                settings.MonitorItems.Add(item);
-                                changed = true;
-                            }
-                            else
-                            {
-                                // Update Existing Item
-                                string safeLabel = !string.IsNullOrEmpty(finalName) ? finalName : (tmpl.Meta.Name + " " + output.Key);
-                                string safeShort = !string.IsNullOrEmpty(finalShort) ? finalShort : output.Key;
-
-                                if (item.DynamicLabel != safeLabel) { item.DynamicLabel = safeLabel; changed = true; }
-                                if (item.DynamicTaskbarLabel != safeShort) { item.DynamicTaskbarLabel = safeShort; changed = true; }
-                                // ★★★ [建议] 注释掉下面这两行，防止重启后强制覆盖用户的设置 ★★★
-                                // if (item.UnitPanel != output.Unit) { item.UnitPanel = output.Unit; changed = true; }
-                                // if (item.UnitTaskbar != output.Unit) { item.UnitTaskbar = output.Unit; changed = true; } // [Fix] Sync Unit to Taskbar as well
-                            }
+                            mergedInputs[input.Key] = input.DefaultValue;
                         }
                     }
                 }
 
-                // Cleanup Orphaned Items for this Instance
-                var toRemove = settings.MonitorItems
-                    .Where(x => x.Key.StartsWith(PluginConstants.DASH_PREFIX + inst.Id + ".") && !validKeys.Contains(x.Key))
-                    .ToList();
+                string keySuffix = (inst.Targets != null && inst.Targets.Count > 0) ? $".{i}" : "";
 
-                foreach (var item in toRemove)
+                if (tmpl.Outputs != null)
                 {
-                    settings.MonitorItems.Remove(item);
-                    changed = true;
+                    foreach (var output in tmpl.Outputs)
+                    {
+                        string itemKey = PluginConstants.DASH_PREFIX + inst.Id + keySuffix + "." + output.Key;
+                        validKeys.Add(itemKey);
+
+                        // 注入 Loading 状态 (仅当当前无值时)
+                        if (string.IsNullOrEmpty(InfoService.Instance.GetValue(itemKey)))
+                        {
+                            InfoService.Instance.InjectValue(itemKey, PluginConstants.STATUS_LOADING);
+                        }
+                        // ★★★ [新增] 顺便注入默认单位，这样 MetricUtils 就能查到了 ★★★
+                        InfoService.Instance.InjectValue(itemKey + ".Unit", output.Unit);
+
+                        var item = items.FirstOrDefault(x => x.Key == itemKey);
+
+                        string labelPattern = output.Label;
+                        if (string.IsNullOrEmpty(labelPattern)) labelPattern = (tmpl.Meta.Name) + " " + output.Key;
+
+                        string finalName = PluginProcessor.ResolveTemplate(labelPattern, mergedInputs);
+                        string finalShort = PluginProcessor.ResolveTemplate(output.ShortLabel, mergedInputs);
+
+                        if (item == null)
+                        {
+                            // Create New Item
+                            string safeLabel = !string.IsNullOrEmpty(finalName) ? finalName : (tmpl.Meta.Name + " " + output.Key);
+                            string safeShort = !string.IsNullOrEmpty(finalShort) ? finalShort : output.Key;
+
+                            // [Optimization] Smart Insert: Follow last sibling based on SortIndex
+                            string prefix = PluginConstants.DASH_PREFIX + inst.Id + ".";
+                            var siblings = items.Where(x => x.Key.StartsWith(prefix)).ToList();
+
+                            var lastSortPeer = siblings.OrderByDescending(x => x.SortIndex).FirstOrDefault();
+                            var lastTbSortPeer = siblings.OrderByDescending(x => x.TaskbarSortIndex).FirstOrDefault();
+
+                            int nextSort = (lastSortPeer?.SortIndex ?? (items.Any() ? items.Max(x => x.SortIndex) : 0)) + 1;
+                            int nextTbSort = (lastTbSortPeer?.TaskbarSortIndex ?? (items.Any() ? items.Max(x => x.TaskbarSortIndex) : 0)) + 1;
+
+                            // Shift others to make room
+                            foreach (var m in items)
+                            {
+                                if (m.SortIndex >= nextSort) m.SortIndex++;
+                                if (m.TaskbarSortIndex >= nextTbSort) m.TaskbarSortIndex++;
+                            }
+
+                            item = new MonitorItemConfig
+                            {
+                                Key = itemKey,
+                                UserLabel = "", // Auto mode
+                                DynamicLabel = safeLabel,
+                                TaskbarLabel = "", // Auto mode
+                                DynamicTaskbarLabel = safeShort,
+                                UnitPanel = output.Unit,
+                                UnitTaskbar = output.Unit, // [Fix] Sync Unit to Taskbar as well
+                                VisibleInPanel = true,
+                                SortIndex = nextSort,
+                                TaskbarSortIndex = nextTbSort,
+                            };
+                            items.Add(item);
+                            structureChanged = true;
+                            changed = true;
+                        }
+                        else
+                        {
+                            // Update Existing Item
+                            string safeLabel = !string.IsNullOrEmpty(finalName) ? finalName : (tmpl.Meta.Name + " " + output.Key);
+                            string safeShort = !string.IsNullOrEmpty(finalShort) ? finalShort : output.Key;
+
+                            if (item.DynamicLabel != safeLabel) { item.DynamicLabel = safeLabel; changed = true; }
+                            if (item.DynamicTaskbarLabel != safeShort) { item.DynamicTaskbarLabel = safeShort; changed = true; }
+                            // ★★★ [建议] 注释掉下面这两行，防止重启后强制覆盖用户的设置 ★★★
+                            // if (item.UnitPanel != output.Unit) { item.UnitPanel = output.Unit; changed = true; }
+                            // if (item.UnitTaskbar != output.Unit) { item.UnitTaskbar = output.Unit; changed = true; } // [Fix] Sync Unit to Taskbar as well
+                        }
+                    }
                 }
-            } // End Lock
+            }
+
+            // Cleanup Orphaned Items for this Instance
+            var toRemove = items
+                .Where(x => x.Key.StartsWith(PluginConstants.DASH_PREFIX + inst.Id + ".") && !validKeys.Contains(x.Key))
+                .ToList();
+
+            foreach (var item in toRemove)
+            {
+                items.Remove(item);
+                structureChanged = true;
+                changed = true;
+            }
+
+            if (structureChanged) settings.MonitorItems = items;
 
             if (changed && saveIfChanged) settings.Save();
             return changed;
@@ -163,14 +167,12 @@ namespace LiteMonitor.src.Plugins
         {
             var settings = Settings.Load();
             string mainKey = PluginConstants.DASH_PREFIX + instanceId;
-            var itemsToRemove = settings.MonitorItems.Where(x => x.Key == mainKey || x.Key.StartsWith(mainKey + ".")).ToList();
+            bool IsMatch(MonitorItemConfig x) => x.Key == mainKey || x.Key.StartsWith(mainKey + ".");
 
-            if (itemsToRemove.Count > 0)
+            if (settings.MonitorItems.Any(IsMatch))
             {
-                foreach (var item in itemsToRemove)
-                {
-                    settings.MonitorItems.Remove(item);
-                }
+                // 写时复制：过滤出新列表后整体替换，不原地删除已发布的列表
+                settings.MonitorItems = settings.MonitorItems.Where(x => !IsMatch(x)).ToList();
                 if (saveIfChanged) settings.Save();
             }
         }

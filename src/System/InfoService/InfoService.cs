@@ -163,7 +163,7 @@ namespace LiteMonitor.src.SystemServices.InfoService
         public void InjectValue(string key, string value)
         {
             if (string.IsNullOrEmpty(key)) return;
-            // [Optimization] Intern keys and values from external injections
+            // [Optimization] 只对 key 做 Intern（key 集合有限且长期复用）；value 会随刷新不断变化，不进全局字符串池
             SetData(UIUtils.Intern(key), value);
         }
 
@@ -315,16 +315,8 @@ namespace LiteMonitor.src.SystemServices.InfoService
         {
             lock (_lock)
             {
-                // [Optimization] Intern values to reduce duplicates (e.g. "KB/s", "luffy-pc")
-                // [Fix] Do NOT intern dynamic time strings (Time, Uptime) as they change constantly and pollute the pool
-                if (key == KEY_TIME || key == KEY_UPTIME)
-                {
-                    _data[key] = value;
-                }
-                else
-                {
-                    _data[key] = UIUtils.Intern(value);
-                }
+                // value 不做 Intern：数值、时间、插件输出每次刷新都会变，进全局字符串池会让池无限增长且永不释放
+                _data[key] = value;
             }
         }
     }

@@ -3,8 +3,10 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using LiteMonitor.src.Core; // Added for UIUtils
+using LiteMonitor.src.SystemServices;
 using LiteMonitor.src.SystemServices.InfoService;
 
 namespace LiteMonitor.src.Plugins.Native
@@ -15,15 +17,17 @@ namespace LiteMonitor.src.Plugins.Native
         private const string JSON_DB_URL = "https://litemonitor.cn/update/CityCode.json";
         
         // Memory Cache
-        private static Dictionary<string, List<List<string>>> _db = null;
-        private static bool _isLoading = false;
-        private static readonly object _lock = new object();
+        // 只在构建完整后一次性赋值；volatile 保证其他线程读到的是完整字典
+        private static volatile Dictionary<string, List<List<string>>>? _db;
+        private static readonly SemaphoreSlim _loadGate = new(1, 1);
 
         public static async Task<string> ResolveAsync(string province, string city, string district)
         {
             await EnsureDbLoadedAsync();
 
-            if (_db == null) throw new Exception("CityCode DB failed to load");
+            // 取一次引用，整个查询只用这份快照
+            var db = _db;
+            if (db == null) throw new Exception("CityCode DB failed to load");
 
             // 1. 参数清洗
             province = (province ?? "").Replace("省", "").Replace("市", "").Replace("自治区", "").Replace("壮族", "").Replace("回族", "").Replace("维吾尔", "");
@@ -44,14 +48,14 @@ namespace LiteMonitor.src.Plugins.Native
             // 3.1 优先查 District
             if (!string.IsNullOrEmpty(district))
             {
-                candidates = Lookup(district);
+                candidates = Lookup(db, district);
                 targetName = district;
             }
 
             // 3.2 降级查 City
             if (candidates == null && !string.IsNullOrEmpty(city))
             {
-                candidates = Lookup(city);
+                candidates = Lookup(db, city);
                 targetName = city;
             }
 
@@ -95,40 +99,36 @@ namespace LiteMonitor.src.Plugins.Native
             });
         }
 
-        private static List<List<string>> Lookup(string key)
+        private static List<List<string>> Lookup(Dictionary<string, List<List<string>>> db, string key)
         {
             if (string.IsNullOrEmpty(key)) return null;
-            if (_db.TryGetValue(key, out var res)) return res;
+            if (db.TryGetValue(key, out var res)) return res;
 
             // 处理后缀
             string root = System.Text.RegularExpressions.Regex.Replace(key, "(自治州|自治县|地区|盟|市|区|县|旗)$", "");
             if (root.Length < 2 && key.Length > 1) root = key;
 
-            if (_db.TryGetValue(root, out var resRoot)) return resRoot;
+            if (db.TryGetValue(root, out var resRoot)) return resRoot;
 
             return null;
         }
 
         public static void ResetClient()
         {
-            lock (_lock)
-            {
-                _db = null; // Force reload on reset
-            }
+            // 网络重置只影响 HttpClient；这里每次加载都新建 HttpClient，城市码库本身不需要丢弃。
+            // 保留方法签名，避免改调用方。
         }
 
         private static async Task EnsureDbLoadedAsync()
         {
             if (_db != null) return;
-            if (_isLoading) 
-            {
-                await Task.Delay(100); 
-                if (_db != null) return;
-            }
 
-            _isLoading = true;
+            // 同一时刻只让一个调用方去下载；其余调用方等它结束后复查 _db
+            await _loadGate.WaitAsync();
             try
             {
+                if (_db != null) return;
+
                 // [Optimization] Use SocketsHttpHandler with Proxy support and Decompression
                 var handler = new SocketsHttpHandler
                 {
@@ -155,8 +155,9 @@ namespace LiteMonitor.src.Plugins.Native
 
                     // [Optimization] Intern strings in the DB to reduce memory usage
                     // Many cities share the same province name, and many districts share the same city name
-                    _db = new Dictionary<string, List<List<string>>>(rawDb.Count);
-                    
+                    // 先建到局部变量，建完整后再一次性赋给 _db，避免其他线程读到半成品
+                    var db = new Dictionary<string, List<List<string>>>(rawDb.Count);
+
                     foreach (var kvp in rawDb)
                     {
                         // Key (district name) can also be interned
@@ -173,17 +174,20 @@ namespace LiteMonitor.src.Plugins.Native
                             }
                             lists.Add(newItem);
                         }
-                        _db[key] = lists;
+                        db[key] = lists;
                     }
+
+                    _db = db;
                 }
             }
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine($"[CityCodeResolver] Load DB Failed: {ex.Message}");
+                AppLog.Warn("Plugin.CityCode", "城市码库加载失败", ex);
             }
             finally
             {
-                _isLoading = false;
+                _loadGate.Release();
             }
         }
     }

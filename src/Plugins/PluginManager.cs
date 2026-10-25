@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using LiteMonitor;
 using LiteMonitor.src.Core;
 using LiteMonitor.src.WebServer;
+using LiteMonitor.src.SystemServices;
 using LiteMonitor.src.SystemServices.InfoService;
 
 namespace LiteMonitor.src.Plugins
@@ -22,8 +23,9 @@ namespace LiteMonitor.src.Plugins
         public static PluginManager Instance => _instance ??= new PluginManager();
 
         private readonly List<PluginTemplate> _templates = new();
-        private readonly Dictionary<string, System.Timers.Timer> _timers = new();
-        private readonly Dictionary<string, System.Threading.CancellationTokenSource> _cts = new();
+        // Timer 回调线程、UI 线程都会访问，用并发字典
+        private readonly ConcurrentDictionary<string, System.Timers.Timer> _timers = new();
+        private readonly ConcurrentDictionary<string, System.Threading.CancellationTokenSource> _cts = new();
         private readonly ConcurrentDictionary<string, int> _consecutiveFailures = new();
         private readonly Dictionary<string, string> _configSnapshots = new();
         private readonly PluginExecutor _executor;
@@ -207,14 +209,14 @@ namespace LiteMonitor.src.Plugins
             {
                 timer.Stop();
                 timer.Dispose();
-                _timers.Remove(instanceId);
+                _timers.TryRemove(instanceId, out _);
             }
 
             if (_cts.TryGetValue(instanceId, out var cts))
             {
                 cts.Cancel();
                 cts.Dispose();
-                _cts.Remove(instanceId);
+                _cts.TryRemove(instanceId, out _);
             }
 
             // Reset failure count
@@ -311,15 +313,14 @@ namespace LiteMonitor.src.Plugins
             if (LiteWebServer.Instance != null && LiteWebServer.Instance.IsRunning) return true;
 
             // 2. Monitor Items Visibility Check
+            // 列表采用写时复制，读一次引用后枚举这份快照即可，无需加锁
             string prefix = PluginConstants.DASH_PREFIX + instanceId + ".";
-            lock (settings.MonitorItems)
+            var items = settings.MonitorItems;
+            foreach (var item in items)
             {
-                foreach (var item in settings.MonitorItems)
+                if (item.Key.StartsWith(prefix))
                 {
-                    if (item.Key.StartsWith(prefix))
-                    {
-                        if (item.VisibleInPanel || item.VisibleInTaskbar) return true;
-                    }
+                    if (item.VisibleInPanel || item.VisibleInTaskbar) return true;
                 }
             }
             return false;
@@ -351,19 +352,18 @@ namespace LiteMonitor.src.Plugins
             
             newTimer.Elapsed += async (s, e) => 
             {
-                if (cts.IsCancellationRequested) return;
-
-                // [Optimization] On-Demand Update: Skip if not visible
-                if (!IsPluginVisible(inst.Id))
+                // 整个回调包在 try/finally 里：Timer 是 AutoReset=false，任何路径都必须经 finally 决定是否重新排程
+                bool reschedule = true;
+                try
                 {
-                    newTimer.Interval = 2000; // Check again in 2s
-                    return;
-                }
+                    if (cts.IsCancellationRequested) { reschedule = false; return; }
 
-                try 
-                {
+                    // [Optimization] On-Demand Update: Skip if not visible
+                    if (!IsPluginVisible(inst.Id)) { newTimer.Interval = 2000; return; }   // 不可见：2 秒后再查
+
                     // Execute and get success status
                     bool success = await _executor.ExecuteInstanceAsync(inst, tmpl, cts.Token);
+                    if (cts.IsCancellationRequested) { reschedule = false; return; }      // 执行中被停止：不计失败
                     
                     // 动态调整间隔：如果失败，使用快速重试间隔 (5s)；如果成功，恢复正常间隔
                     if (!success)
@@ -391,8 +391,14 @@ namespace LiteMonitor.src.Plugins
                         newTimer.Interval = interval * 1000;
                     }
                 }
+                catch (OperationCanceledException) when (cts.IsCancellationRequested)
+                {
+                    // 实例被停止导致的取消不是失败：不计失败次数，也不重新排程
+                    reschedule = false;
+                }
                 catch (Exception ex)
                 {
+                    AppLog.Warn($"Plugin.{inst.Id}", "插件执行失败", ex);
                     System.Diagnostics.Debug.WriteLine($"Timer execution failed: {ex.Message}");
                     
                     // 异常逻辑：同样应用退避
@@ -402,15 +408,18 @@ namespace LiteMonitor.src.Plugins
                 }
                 finally 
                 {
-                    if (_timers.ContainsKey(inst.Id) && inst.Enabled && !cts.IsCancellationRequested)
+                    // 只有仍登记在 _timers 里的当前 Timer 才重新排程（实例被停止或重启后，旧 Timer 不再复活）
+                    if (reschedule && inst.Enabled && !cts.IsCancellationRequested
+                        && _timers.TryGetValue(inst.Id, out var current) && ReferenceEquals(current, newTimer))
                     {
-                        try { newTimer.Start(); } catch {} 
+                        try { newTimer.Start(); } catch (ObjectDisposedException) { }
                     }
                 }
             };
             
-            newTimer.Start();
+            // 先登记再启动：回调的 finally 会用 _timers 确认自己仍是当前 Timer
             _timers[inst.Id] = newTimer;
+            newTimer.Start();
             
             // ★★★ Inject Initial Loading State ★★★
             InitDefaultValues(inst, tmpl);

@@ -152,6 +152,8 @@ namespace LiteMonitor
         [JsonIgnore] public DateTime LastAutoSaveTime { get; set; } = DateTime.MinValue;
 
         public Dictionary<string, string> GroupAliases { get; set; } = new Dictionary<string, string>();
+        // 运行期该列表采用写时复制：增删或排序要先复制、修改副本、再整体赋值给本属性；
+        // 已发布的列表实例不得原地增删。后台线程读取时先取一次引用再枚举。
         public List<MonitorItemConfig> MonitorItems { get; set; } = new List<MonitorItemConfig>();
         public List<PluginInstanceConfig> PluginInstances { get; set; } = new List<PluginInstanceConfig>();
 
