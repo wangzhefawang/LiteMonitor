@@ -29,6 +29,15 @@ namespace LiteMonitor
         private bool _fillingGrid;
         private float _scale = 1.0f;
 
+        // 窗体自己创建的字体：各只创建一次，它们在 Dispose 中释放
+        private readonly Font _uiFont = new Font("Microsoft YaHei UI", 9F);
+        private readonly Font _gridHeaderFont = new Font("Microsoft YaHei UI", 9, FontStyle.Regular);
+        private readonly Font _gridCellFont = new Font("Consolas", 10);
+        private readonly Font _summaryFont = new Font("Microsoft YaHei UI", 8.5F);
+
+        // 摘要栏已创建的控件：序列数不变时只更新内容，避免每次刷新都重建控件
+        private readonly List<(Panel Box, Panel Line, Label Label)> _summaryBoxes = new List<(Panel Box, Panel Line, Label Label)>();
+
         private readonly Color C_Back = Color.FromArgb(32, 32, 32);
         private readonly Color C_Panel = Color.FromArgb(45, 45, 45);
         private readonly Color C_GridBack = Color.FromArgb(38, 38, 38);
@@ -76,7 +85,7 @@ namespace LiteMonitor
             StartPosition = FormStartPosition.Manual;
             BackColor = C_Back;
             ForeColor = C_TextMain;
-            Font = new Font("Microsoft YaHei UI", 9F);
+            Font = _uiFont;
 
             SuspendLayout();
 
@@ -190,14 +199,14 @@ namespace LiteMonitor
 
             grid.ColumnHeadersDefaultCellStyle.BackColor = C_Header;
             grid.ColumnHeadersDefaultCellStyle.ForeColor = Color.Gainsboro;
-            grid.ColumnHeadersDefaultCellStyle.Font = new Font("Microsoft YaHei UI", 9, FontStyle.Regular);
+            grid.ColumnHeadersDefaultCellStyle.Font = _gridHeaderFont;
             grid.ColumnHeadersDefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
             grid.ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.Single;
             grid.DefaultCellStyle.BackColor = C_GridBack;
             grid.DefaultCellStyle.ForeColor = C_TextMain;
             grid.DefaultCellStyle.SelectionBackColor = Color.FromArgb(70, 70, 70);
             grid.DefaultCellStyle.SelectionForeColor = Color.White;
-            grid.DefaultCellStyle.Font = new Font("Consolas", 10);
+            grid.DefaultCellStyle.Font = _gridCellFont;
             grid.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleRight;
             grid.RowTemplate.Height = S(32);
 
@@ -273,21 +282,47 @@ namespace LiteMonitor
 
         private void FillSummary()
         {
-            _summaryPanel.SuspendLayout();
-            _summaryPanel.Controls.Clear();
-
+            // 摘要条目：文本 + 强调色；没有序列时只有一条空数据提示，使用默认强调色
+            var entries = new List<(string Text, Color? Accent)>();
             if (_currentSeries.Count == 0)
             {
-                AddSummaryText(_chart.EmptyText);
-                _summaryPanel.ResumeLayout();
-                return;
+                entries.Add((_chart.EmptyText, null));
+            }
+            else
+            {
+                foreach (var s in _currentSeries)
+                {
+                    float latest = s.Points.Last().Avg;
+                    float max = s.Points.Max(p => p.Max);
+                    entries.Add(($"{s.Label}  {FormatMetric(latest, s.Unit)} / {FormatMetric(max, s.Unit)}", s.Color));
+                }
             }
 
-            foreach (var s in _currentSeries)
+            _summaryPanel.SuspendLayout();
+
+            if (entries.Count == _summaryBoxes.Count)
             {
-                float latest = s.Points.Last().Avg;
-                float max = s.Points.Max(p => p.Max);
-                AddSummaryText($"{s.Label}  {FormatMetric(latest, s.Unit)} / {FormatMetric(max, s.Unit)}", s.Color);
+                // 数量没变：原地更新文本、强调色和宽度，不创建控件
+                int width = GetSummaryBoxWidth();
+                for (int i = 0; i < entries.Count; i++)
+                {
+                    var (box, line, label) = _summaryBoxes[i];
+                    label.Text = entries[i].Text;
+                    line.BackColor = entries[i].Accent ?? C_Accent;
+                    box.Width = width;
+                }
+            }
+            else
+            {
+                // 数量变了：先释放旧控件（释放 box 会连带释放其子控件），再重建
+                foreach (var b in _summaryBoxes) b.Box.Dispose();
+                _summaryBoxes.Clear();
+                _summaryPanel.Controls.Clear();
+
+                foreach (var (text, accent) in entries)
+                {
+                    AddSummaryText(text, accent);
+                }
             }
 
             _summaryPanel.ResumeLayout();
@@ -503,7 +538,7 @@ namespace LiteMonitor
                 BackColor = C_Back,
                 ForeColor = C_TextDim,
                 Cursor = Cursors.Hand,
-                Font = new Font("Microsoft YaHei UI", 9)
+                Font = _uiFont
             };
             btn.FlatAppearance.BorderSize = 0;
             return btn;
@@ -572,7 +607,7 @@ namespace LiteMonitor
                 Dock = DockStyle.Fill,
                 Text = text,
                 ForeColor = C_TextMain,
-                Font = new Font("Microsoft YaHei UI", 8.5F),
+                Font = _summaryFont,
                 TextAlign = ContentAlignment.MiddleLeft,
                 Padding = new Padding(S(8), 0, S(4), 0),
                 AutoEllipsis = true
@@ -581,6 +616,7 @@ namespace LiteMonitor
             box.Controls.Add(label);
             box.Controls.Add(line);
             _summaryPanel.Controls.Add(box);
+            _summaryBoxes.Add((box, line, label));
         }
 
         private void AddLabel(FlowLayoutPanel panel, string text)
@@ -662,6 +698,19 @@ namespace LiteMonitor
             _timer.Stop();
             _timer.Dispose();
             base.OnFormClosed(e);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            // 先释放控件，再释放它们引用的字体；字体归窗体所有，控件释放不会连带释放它们
+            base.Dispose(disposing);
+            if (disposing)
+            {
+                _uiFont.Dispose();
+                _gridHeaderFont.Dispose();
+                _gridCellFont.Dispose();
+                _summaryFont.Dispose();
+            }
         }
     }
 }

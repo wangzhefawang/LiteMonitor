@@ -35,15 +35,24 @@ namespace LiteMonitor
         {     
             var s = cfg.GetStyle();
 
-            // ★★★ 修复：先释放旧字体资源，防止 GDI 句柄泄漏 ★★★
-            if (_cachedFont != null)
+            // 字体归本类所有：自己创建、自己释放，不使用 UIUtils 的共享字体缓存
+            // （共享缓存会被 ClearBrushCache 统一释放，这里再释放会得到已释放的实例）
+            var style = s.Bold ? FontStyle.Bold : FontStyle.Regular;
+            Font newFont;
+            try
             {
-                try { _cachedFont.Dispose(); } catch { }
-                _cachedFont = null;
+                newFont = new Font(s.Font, s.Size, style);
+            }
+            catch
+            {
+                // 字体名不可用时回退到系统默认字体族（与 UIUtils 的字体缓存一致）
+                newFont = new Font(SystemFonts.DefaultFont.FontFamily, s.Size, style);
             }
 
-            // 无论开关怎么变，这里拿到的永远是正确参数
-            _cachedFont = UIUtils.GetFont(s.Font, s.Size, s.Bold);
+            // 先换入新字体，再释放自己上一次创建的字体
+            var oldFont = _cachedFont;
+            _cachedFont = newFont;
+            oldFont?.Dispose();
 
             // 颜色依然允许自定义
             _useCustom = cfg.TaskbarCustomStyle;
