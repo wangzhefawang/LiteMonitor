@@ -1,5 +1,7 @@
 using System;
 using System.IO;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading; // 必须引用：用于 Mutex
 using System.Windows.Forms;
 using LiteMonitor.src.Core;
@@ -11,6 +13,10 @@ namespace LiteMonitor
     {
         // 保持 Mutex 引用，防止被 GC 回收
         private static Mutex? _mutex = null;
+
+        // UI 线程崩溃弹窗节流：弹窗期间定时器仍在触发，同一故障会反复进入处理器
+        private static readonly TimeSpan CrashDialogInterval = TimeSpan.FromMinutes(10);
+        private static DateTime _lastCrashDialog = DateTime.MinValue;
 
         [STAThread]
         static void Main()
@@ -41,12 +47,14 @@ namespace LiteMonitor
                                                         .Replace(' ', '_');
 
                     // [建议] 增加哈希或长度截断，防止路径过长导致 Mutex 名称超过系统限制 (260字符) 从而抛出异常进入 catch
-                    // 这里简单处理：如果生成的名称太长，就取路径的 HashCode 混淆一下
+                    // 这里简单处理：如果生成的名称太长，就改用路径的 SHA256 哈希（取前 16 字节）
                     string baseName = $"Global\\LiteMonitor_SingleInstance_{sanitizedPath}_Mutex";
                     if (baseName.Length > 250) 
                     {
-                         // 如果路径太长，使用路径的哈希值来保证唯一性且不超长
-                         baseName = $"Global\\LiteMonitor_SingleInstance_{sanitizedPath.GetHashCode()}_Mutex";
+                         // 如果路径太长，使用路径的稳定哈希值来保证唯一性且不超长
+                         // 不能用 string.GetHashCode()：.NET Core 下它每个进程随机化，会让单实例保护失效
+                         string pathHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(appFolderPath!.ToLowerInvariant())), 0, 16);
+                         baseName = $"Global\\LiteMonitor_SingleInstance_{pathHash}_Mutex";
                     }
                     
                     mutexName = baseName;
@@ -117,7 +125,7 @@ namespace LiteMonitor
         // --- 异常处理委托 ---
         static void Application_ThreadException(object sender, ThreadExceptionEventArgs e)
         {
-            LogCrash(e.Exception, "UI_Thread");
+            LogCrash(e.Exception, "UI_Thread", throttleDialog: true);
         }
 
         static void CurrentDomain_UnhandledException(object sender, UnhandledExceptionEventArgs e)
@@ -126,7 +134,7 @@ namespace LiteMonitor
         }
 
         // --- 写入 crash.log 的核心方法 ---
-        static void LogCrash(Exception? ex, string source)
+        static void LogCrash(Exception? ex, string source, bool throttleDialog = false)
         {
             if (ex == null) return;
 
@@ -134,15 +142,17 @@ namespace LiteMonitor
             {
                 // 日志文件保存在程序运行目录下
                 string logPath = Path.Combine(AppContext.BaseDirectory, "LiteMonitor_Error.log");
-                
-                string errorMsg = "==================================================\n" +
-                                  $"[Time]: {DateTime.Now}\n" +
-                                  $"[Source]: {source}\n" +
-                                  $"[Message]: {ex.Message}\n" +
-                                  $"[Stack]:\n{ex.StackTrace}\n" +
-                                  "==================================================\n\n";
 
-                File.AppendAllText(logPath, errorMsg);
+                AppLog.Error(source, "未处理异常", ex);
+
+                // UI 线程异常可能持续触发，弹窗最多每 10 分钟一次；后台线程异常意味着进程即将终止，始终弹窗
+                if (throttleDialog)
+                {
+                    DateTime now = DateTime.UtcNow;
+                    if (now - _lastCrashDialog < CrashDialogInterval) return;
+                    // 必须在 MessageBox.Show 之前更新：模态框打开期间处理器会被重入
+                    _lastCrashDialog = now;
+                }
 
                 // 只有真的崩了才弹窗提示用户
                 MessageBox.Show($"程序遇到致命错误！\n错误日志已保存至：{logPath}\n\n原因：{ex.Message}", 
