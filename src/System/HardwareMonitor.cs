@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading.Tasks;
 using System.Runtime.InteropServices; // ★★★ 新增：引用用于内存修剪的库
@@ -33,7 +34,8 @@ namespace LiteMonitor.src.SystemServices
         // 性能计数器管理器
         private readonly PerformanceCounterManager _perfCounterManager;
 
-        private readonly Dictionary<string, float> _lastValidMap = new();
+        // 并发字典：UI 线程和 Web 线程都会读写
+        private readonly ConcurrentDictionary<string, float> _lastValidMap = new();
         
         // 状态标记 (防止并发重载)
         private volatile bool _isReloading = false;
@@ -204,7 +206,7 @@ namespace LiteMonitor.src.SystemServices
                             try { hw.Update(); }
                             catch (Exception ex)
                             {
-                                System.Diagnostics.Debug.WriteLine($"[GPU Error] Update failed: {ex.Message}");
+                                AppLog.Warn("HW.GpuUpdate", "显卡刷新失败，将触发重载", ex);
                                 needsReload = true;
                             }
                             continue; 
@@ -245,7 +247,10 @@ namespace LiteMonitor.src.SystemServices
                 
                 OnValuesUpdated?.Invoke();
             }
-            catch { }
+            catch (Exception ex)
+            {
+                AppLog.Warn("HW.UpdateAll", "硬件刷新失败", ex);
+            }
 
             // [Fix #290] 硬件故障自动恢复
             // 如果检测到 GPU 丢失或驱动崩溃，触发安全重载以刷新硬件列表
@@ -343,7 +348,7 @@ namespace LiteMonitor.src.SystemServices
                 }
                 catch (Exception ex)
                 {
-                    System.Diagnostics.Debug.WriteLine($"Init Error: {ex.Message}");
+                    AppLog.Warn("HW.Init", "硬件初始化失败", ex);
                 }
                 finally
                 {
@@ -502,7 +507,10 @@ namespace LiteMonitor.src.SystemServices
                 GC.Collect();
                 SystemOptimizer.TrimWorkingSet();
             }
-            catch { }
+            catch (Exception ex)
+            {
+                AppLog.Warn("HW.Reload", "硬件重载失败", ex);
+            }
         }
 
         private void ReleaseComputerForDriverInstall()
@@ -529,7 +537,10 @@ namespace LiteMonitor.src.SystemServices
                     }
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                AppLog.Warn("HW.Release", "释放硬件监控失败", ex);
+            }
         }
 
         // =========================================================

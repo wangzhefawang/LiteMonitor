@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -17,7 +18,7 @@ namespace LiteMonitor.src.SystemServices
         private readonly DiskManager _diskManager;
         private readonly FpsCounter _fpsCounter;
         private readonly object _lock;
-        private readonly Dictionary<string, float> _lastValidMap; 
+        private readonly ConcurrentDictionary<string, float> _lastValidMap;
         
         // 子服务与处理器
         private readonly PerformanceCounterManager _perfManager;
@@ -41,7 +42,7 @@ namespace LiteMonitor.src.SystemServices
         private string _lastPrefNet = "";
         private string _lastPrefGpu = "";
         
-        public HardwareValueProvider(Computer c, Settings s, SensorMap map, NetworkManager net, DiskManager disk, FpsCounter fpsCounter,PerformanceCounterManager perfManager, object syncLock, Dictionary<string, float> lastValid)
+        public HardwareValueProvider(Computer c, Settings s, SensorMap map, NetworkManager net, DiskManager disk, FpsCounter fpsCounter,PerformanceCounterManager perfManager, object syncLock, ConcurrentDictionary<string, float> lastValid)
         {
             _computer = c;
             _cfg = s;
@@ -267,9 +268,7 @@ namespace LiteMonitor.src.SystemServices
                 if (!lockTaken) 
                 {
                     // ★★★ [Fix] 如果无法获取锁（硬件正在重载），优先返回上一帧的有效值，防止 UI 闪烁 ★★★
-                    // 因为 _lastValidMap 仅在 GetValue 内部（即 UI 线程）写入，
-                    // 而后台线程（UpdateAll/Reload）只读不写或完全不访问它，
-                    // 所以此时读取是安全的（虽然没有锁，但没有并发写入）。
+                    // _lastValidMap 是并发字典，拿不到硬件锁时也能安全读取上一帧的有效值
                     if (_lastValidMap.TryGetValue(key, out float lastVal)) return lastVal;
                     return null;
                 }

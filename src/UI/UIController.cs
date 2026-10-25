@@ -249,7 +249,12 @@ namespace LiteMonitor
                     }
                 }
 
-                _form.Invalidate();   
+                _form.Invalidate();
+            }
+            catch (Exception ex)
+            {
+                // async void 里的未处理异常会直接冲到全局处理器，这里记录后继续下一轮刷新
+                AppLog.Warn("UI.Tick", "刷新失败", ex);
             }
             finally
             {

@@ -35,7 +35,8 @@ namespace LiteMonitor.src.SystemServices
         // ★★★ [新增] 启动锁和最后 activity 时间，用于控制进程生命周期 ★★★
         private bool _isStarting = false;    // 防止重复启动的标志
         private DateTime _lastAccessTime = DateTime.MinValue; // 最后一次被 UI 请求数据的时间
-        
+        private volatile bool _downloadPrompted = false;      // 本轮是否已提示过下载 FPS 组件（FPS 项关闭 5 秒后重置）
+
         private Process? _presentMonProc;     // PresentMon 进程实例
         private DateTime _lastDataTime = DateTime.MinValue; // 最后一次收到数据的时间
         
@@ -149,6 +150,9 @@ namespace LiteMonitor.src.SystemServices
         /// <returns>当前聚焦进程的 FPS 值，无数据时返回 0</returns>
         public float? GetFps()
         {
+            // FPS 项关闭超过 5 秒后再次开启，允许重新提示下载（与 CheckHealth 的自动关闭阈值一致）
+            if ((DateTime.Now - _lastAccessTime).TotalSeconds > 5) _downloadPrompted = false;
+
             // ★★★ [修改] 记录本次访问时间，并触发惰性启动 ★★★
             _lastAccessTime = DateTime.Now;
 
@@ -181,7 +185,8 @@ namespace LiteMonitor.src.SystemServices
             if (challengerPid == 0) return 0f;
 
             // 焦点进程仲裁逻辑
-            if (_currentFocusPid == 0 || !_calculatedProcessFps.ContainsKey(_currentFocusPid))
+            // 只查一次字典：焦点进程可能在两次查找之间被后台线程移除
+            if (_currentFocusPid == 0 || !_calculatedProcessFps.TryGetValue(_currentFocusPid, out float currentFps))
             {
                 // 当前无焦点或焦点进程已退出，直接切换
                 _currentFocusPid = challengerPid;
@@ -190,8 +195,7 @@ namespace LiteMonitor.src.SystemServices
             else if (challengerPid != _currentFocusPid)
             {
                 // 有新的挑战者进程
-                float currentFps = _calculatedProcessFps[_currentFocusPid];
-                
+
                 // 判断是否是 DWM 进程（桌面窗口管理器）
                 bool isChallengerDwm = IsDwm(challengerPid);
 
@@ -309,14 +313,19 @@ namespace LiteMonitor.src.SystemServices
                 // 检查是否有管理员权限（PresentMon 需要管理员权限）
                 if (!IsAdministrator()) return;
                 
-                // ★★★ [修改] 如果 PresentMon 不存在，调用 DriverInstaller 自动下载 ★★★
+                // ★★★ [修改] 如果 PresentMon 不存在，每轮只提示一次下载，且不阻塞等待 ★★★
+                // 下载成功后，下一次 GetFps 会自然重新走到这里并启动服务；用户取消则本轮不再弹窗
                 if (!File.Exists(ExePath))
                 {
-                    var downloadTask = _driverInstaller.CheckAndDownloadPresentMon(silent: true);
-                    downloadTask.Wait(); 
+                    if (!_downloadPrompted)
+                    {
+                        _downloadPrompted = true;
+                        _driverInstaller.CheckAndDownloadPresentMon(silent: true).ContinueWith(
+                            t => AppLog.Warn("FPS.Download", "FPS 组件下载失败", t.Exception),
+                            TaskContinuationOptions.OnlyOnFaulted);
+                    }
+                    return;
                 }
-                
-                if (!File.Exists(ExePath)) return;
 
                 // 清理可能存在的僵尸进程
                 ForceKillZombies();

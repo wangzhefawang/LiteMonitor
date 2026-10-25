@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -213,7 +214,7 @@ namespace LiteMonitor.src.SystemServices
         // ===========================================================
         // 获取最佳网络数值 (已简化：Preferred 逻辑已移至 ValueProvider 静态缓存)
         // ===========================================================
-        public float? GetBestValue(string key, Computer computer, Settings cfg, Dictionary<string, float> lastValidMap, object syncLock)
+        public float? GetBestValue(string key, Computer computer, Settings cfg, ConcurrentDictionary<string, float> lastValidMap, object syncLock)
         {
             // 2. 自动选优 (带缓存) - 原 GetBestNetworkValue
             // A. 尝试运行时缓存
@@ -298,7 +299,7 @@ namespace LiteMonitor.src.SystemServices
             return null;
         }
 
-        private float? ReadNetworkSensor(IHardware hw, string key, Dictionary<string, float> lastValidMap, object syncLock)
+        private float? ReadNetworkSensor(IHardware hw, string key, ConcurrentDictionary<string, float> lastValidMap, object syncLock)
         {
             ISensor? target = null;
             foreach (var s in hw.Sensors)
