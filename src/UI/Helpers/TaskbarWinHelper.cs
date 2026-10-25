@@ -86,6 +86,40 @@ namespace LiteMonitor.src.UI.Helpers
     }
 
     /// <summary>
+    /// SetWindowPos 去重：参数与上次完全相同且距上次设置不到 5 秒时跳过调用。
+    /// 各策略各持一个实例；重新挂载（换父窗口）时调用 Reset，保证一定会重新定位。
+    /// </summary>
+    internal sealed class SetWindowPosMemo
+    {
+        private const long RepeatMs = 5000;
+
+        private bool _has;
+        private IntPtr _hwnd;
+        private IntPtr _insertAfter;
+        private int _x, _y, _w, _h;
+        private uint _flags;
+        private long _expire; // 超过该时刻后即使参数相同也要重设一次
+
+        public void Reset() => _has = false;
+
+        public void Apply(IntPtr hwnd, IntPtr insertAfter, int x, int y, int w, int h, uint flags)
+        {
+            long now = Environment.TickCount64;
+            if (_has && now < _expire
+                && hwnd == _hwnd && insertAfter == _insertAfter
+                && x == _x && y == _y && w == _w && h == _h && flags == _flags)
+                return;
+
+            // 调用失败时不记录，下一次 Tick 照常重试
+            _has = SetWindowPos(hwnd, insertAfter, x, y, w, h, flags);
+            _hwnd = hwnd; _insertAfter = insertAfter;
+            _x = x; _y = y; _w = w; _h = h;
+            _flags = flags;
+            _expire = now + RepeatMs;
+        }
+    }
+
+    /// <summary>
     /// 任务栏窗口底层助手 (Windows Helper) - Facade
     /// 职责：作为统一入口，根据系统版本委托给具体的策略 (Strategy) 处理挂载和布局
     /// </summary>
@@ -300,16 +334,36 @@ namespace LiteMonitor.src.UI.Helpers
             return false;
         }
 
+        // 任务栏每次 Tick 都会调用 IsCenterAligned / GetWidgetsWidth，这里缓存注册表读取和目录枚举结果
+        // 对齐方式 (TaskbarAl) 与小组件开关 (TaskbarDa) 缓存 5 秒，小组件包是否存在缓存 60 秒；*Expire 为失效时刻 (TickCount64)
+        private const long RegCacheMs = 5000;
+        private const long PkgCacheMs = 60000;
+        private static long _centerAlignedExpire;
+        private static bool _centerAlignedCache;
+        private static long _widgetsEnabledExpire;
+        private static bool _widgetsEnabledCache;
+        private static long _widgetPkgExpire;
+        private static bool _widgetPkgCache;
+
         public static bool IsCenterAligned()
         {
-            if (Environment.OSVersion.Version.Major < 10 || Environment.OSVersion.Version.Build < 22000) 
+            if (Environment.OSVersion.Version.Major < 10 || Environment.OSVersion.Version.Build < 22000)
                 return false;
+
+            long now = Environment.TickCount64;
+            if (now < _centerAlignedExpire) return _centerAlignedCache;
+
+            bool result;
             try
             {
                 using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced");
-                return ((int)(key?.GetValue("TaskbarAl", 1) ?? 1)) == 1;
+                result = ((int)(key?.GetValue("TaskbarAl", 1) ?? 1)) == 1;
             }
-            catch { return false; }
+            catch { result = false; }
+
+            _centerAlignedCache = result;
+            _centerAlignedExpire = now + RegCacheMs;
+            return result;
         }
 
         public static int GetTaskbarDpi()
@@ -327,18 +381,31 @@ namespace LiteMonitor.src.UI.Helpers
             int dpi = GetTaskbarDpi();
             if (_isWin11)
             {
-                string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-                string pkg = Path.Combine(local, "Packages");
-                bool hasWidgetPkg = false;
-                try { hasWidgetPkg = Directory.GetDirectories(pkg, "MicrosoftWindows.Client.WebExperience*").Any(); } catch {}
-                
-                if (!hasWidgetPkg) return 0;
+                long now = Environment.TickCount64;
 
-                using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced");
-                if (key == null) return 0;
+                if (now >= _widgetPkgExpire)
+                {
+                    string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                    string pkg = Path.Combine(local, "Packages");
+                    bool hasWidgetPkg = false;
+                    try { hasWidgetPkg = Directory.GetDirectories(pkg, "MicrosoftWindows.Client.WebExperience*").Any(); } catch {}
 
-                object? val = key.GetValue("TaskbarDa");
-                if (val is int i && i != 0) return 150 * dpi / 96;
+                    _widgetPkgCache = hasWidgetPkg;
+                    _widgetPkgExpire = now + PkgCacheMs;
+                }
+
+                if (!_widgetPkgCache) return 0;
+
+                if (now >= _widgetsEnabledExpire)
+                {
+                    using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced");
+                    object? val = key?.GetValue("TaskbarDa");
+
+                    _widgetsEnabledCache = val is int i && i != 0;
+                    _widgetsEnabledExpire = now + RegCacheMs;
+                }
+
+                if (_widgetsEnabledCache) return 150 * dpi / 96;
             }
             return 0;
         }

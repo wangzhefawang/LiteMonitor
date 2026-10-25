@@ -93,6 +93,10 @@ namespace LiteMonitor
                 Width = _layout.PanelWidth;
                 _bizHelper.UpdatePlacement(Width);
             }
+
+            // 刷新间隔可能已被修改，同步给定时器 (_timer 是字段初始化器创建的，构造函数里首次调用时已存在)
+            _timer.Interval = Math.Max(_cfg.RefreshMs, 60);
+
             Invalidate();
         }
 

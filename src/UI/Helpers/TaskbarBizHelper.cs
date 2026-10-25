@@ -151,20 +151,30 @@ namespace LiteMonitor.src.UI.Helpers
 
             // ★★★ 水平任务栏定位 ★★★
 
+            // 如果策略自带布局逻辑 (如 Win10 挤占模式)，直接委托处理，位置由 Strategy 内部决定
+            // 提前返回，避免无用的对齐方式 / 小组件宽度检测 (Win10 下 sysCentered 恒为 false，原先也是走到这里)
+            if (_winHelper.UsesInternalLayout)
+            {
+                _winHelper.SetPosition(_hTaskbar, 0, 0, panelWidth, _taskbarHeight, _cfg.TaskbarManualOffset, _cfg.TaskbarAlignLeft);
+                return;
+            }
+
             Screen currentScreen = Screen.FromRectangle(_taskbarRect);
             if (currentScreen == null) currentScreen = Screen.PrimaryScreen;
-            
+
             bool sysCentered = TaskbarWinHelper.IsCenterAligned();
             bool isPrimary = currentScreen.Primary;
-            
-            int rawWidgetWidth = TaskbarWinHelper.GetWidgetsWidth();      
-            int manualOffset = _cfg.TaskbarManualOffset; 
+
+            int manualOffset = _cfg.TaskbarManualOffset;
+            bool alignLeft = _cfg.TaskbarAlignLeft && sysCentered;
+
+            // 小组件宽度只在居左模式或系统靠左时用到，系统居中且不居左时跳过检测
+            int rawWidgetWidth = (alignLeft || !sysCentered) ? TaskbarWinHelper.GetWidgetsWidth() : 0;
             int leftModeTotalOffset = rawWidgetWidth + manualOffset;
             int sysRightAvoid = sysCentered ? 0 : rawWidgetWidth;
             int rightModeTotalOffset = sysRightAvoid + manualOffset;
 
-            int timeWidth = _isWin11 ? 90 : 0; 
-            bool alignLeft = _cfg.TaskbarAlignLeft && sysCentered; 
+            int timeWidth = _isWin11 ? 90 : 0;
 
             topScreen = _taskbarRect.Top;
 
@@ -176,14 +186,6 @@ namespace LiteMonitor.src.UI.Helpers
             }
             else
             {
-                // 如果策略自带布局逻辑 (如 Win10 挤占模式)，直接委托处理
-                // 我们不需要计算 Right 偏移，位置由 Strategy 内部决定
-                if (_winHelper.UsesInternalLayout)
-                {
-                    _winHelper.SetPosition(_hTaskbar, 0, 0, panelWidth, _taskbarHeight, _cfg.TaskbarManualOffset, _cfg.TaskbarAlignLeft);
-                    return;
-                }
-
                 if (isPrimary && _hTray != IntPtr.Zero && _winHelper.GetWindowRectWrapper(_hTray, out Rectangle tray))
                 {
                     leftScreen = tray.Left - panelWidth - 6;

@@ -14,6 +14,9 @@ namespace LiteMonitor.src.UI.Helpers
     {
         private readonly Form _form;
 
+        // 记录上次传给 SetWindowPos 的参数，位置没变且 5 秒内不重复设置
+        private readonly SetWindowPosMemo _posMemo = new();
+
         public bool IsReady => true; // Win11 模式不需要特殊的预热
 
         public bool HasInternalLayout => false;
@@ -28,6 +31,7 @@ namespace LiteMonitor.src.UI.Helpers
             // Win11 直接挂载到任务栏句柄
             SetParent(_form.Handle, taskbarHandle);
             TaskbarWinHelper.ApplyChildWindowStyle(_form.Handle);
+            _posMemo.Reset(); // 换了父窗口，下次必须重新定位
         }
 
         public void SetPosition(IntPtr taskbarHandle, int left, int top, int w, int h, int manualOffset, bool alignLeft)
@@ -61,13 +65,13 @@ namespace LiteMonitor.src.UI.Helpers
                     finalY = pt.Y;
                 }
 
-                SetWindowPos(_form.Handle, IntPtr.Zero, finalX, finalY, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+                _posMemo.Apply(_form.Handle, IntPtr.Zero, finalX, finalY, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
             }
             else
             {
                 // 如果意外脱离，尝试使用 HWND_TOPMOST 保持可见
                 IntPtr HWND_TOPMOST = (IntPtr)(-1);
-                SetWindowPos(_form.Handle, HWND_TOPMOST, finalX, finalY, w, h, SWP_NOACTIVATE);
+                _posMemo.Apply(_form.Handle, HWND_TOPMOST, finalX, finalY, w, h, SWP_NOACTIVATE);
             }
         }
 

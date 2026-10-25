@@ -26,6 +26,9 @@ namespace LiteMonitor.src.UI.Helpers
         private bool _lastAlignLeft = true;
         private bool _lastVertical = false;
 
+        // 记录上次传给 SetWindowPos 的参数，位置没变且 5 秒内不重复设置
+        private readonly SetWindowPosMemo _posMemo = new();
+
         // 优化配置
         private const int GAP_TOLERANCE = 1; // 容忍 1px 的误差，防止反复重绘造成的闪烁
         public bool IsReady => _hReBar != IntPtr.Zero && _hMin != IntPtr.Zero;
@@ -50,6 +53,7 @@ namespace LiteMonitor.src.UI.Helpers
 
             SetParent(_form.Handle, targetParent);
             TaskbarWinHelper.ApplyChildWindowStyle(_form.Handle);
+            _posMemo.Reset(); // 换了父窗口，下次必须重新定位
         }
 
         public IntPtr GetExpectedParent(IntPtr taskbarHandle)
@@ -65,13 +69,13 @@ namespace LiteMonitor.src.UI.Helpers
 
             if (TryAdjustLayout(w, h, manualOffset, alignLeft, out int win10X, out int win10Y))
             {
-                SetWindowPos(_form.Handle, IntPtr.Zero, win10X, win10Y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+                _posMemo.Apply(_form.Handle, IntPtr.Zero, win10X, win10Y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
             }
             else
             {
                 // 如果调整失败（例如找不到句柄），回退到简单定位
                 // 注意：这里也应该应用 manualOffset，但通常 TaskbarBizHelper 对于非 internal layout 已经计算了
-                SetWindowPos(_form.Handle, IntPtr.Zero, left, top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+                _posMemo.Apply(_form.Handle, IntPtr.Zero, left, top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
             }
         }
 
