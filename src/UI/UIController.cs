@@ -231,7 +231,15 @@ namespace LiteMonitor
                 foreach (var col in _hxColsTaskbar) UpdateCol(col);
 
                 HardwareHistoryLogger.RecordSnapshot(_cfg, key => _mon.Get(key));
- 
+
+                // 最大值记录去抖保存：在 UI 线程、硬件锁之外落盘，同一份变更最多每 30 秒一次
+                if (_cfg.MaxRecordDirty && (DateTime.Now - _cfg.LastAutoSaveTime).TotalSeconds > 30)
+                {
+                    _cfg.MaxRecordDirty = false;
+                    _cfg.LastAutoSaveTime = DateTime.Now;
+                    _cfg.Save();
+                }
+
                 CheckTemperatureAlert();
 
                 // 驱动 DashboardService 更新

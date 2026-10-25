@@ -15,6 +15,7 @@ namespace LiteMonitor
         private static readonly string _backupPath = Path.Combine(AppContext.BaseDirectory, "settings.json.bak");
         private static readonly string _tempPath = Path.Combine(AppContext.BaseDirectory, "settings.json.tmp");
         private static readonly object _ioLock = new object();
+        private static readonly JsonSerializerOptions _saveOptions = new JsonSerializerOptions { WriteIndented = true };
         public static string FilePath => _cachedPath;
 
         // Global block save lock
@@ -82,7 +83,7 @@ namespace LiteMonitor
 
             try
             {
-                var json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
+                var json = JsonSerializer.Serialize(settings, _saveOptions);
                 lock (_ioLock)
                 {
                     AtomicWrite(json);
@@ -90,7 +91,11 @@ namespace LiteMonitor
             }
             catch
             {
-                CleanupTempFile();
+                // 清理临时文件要和 AtomicWrite 在同一把锁下，避免删掉别的线程正在写的 tmp
+                lock (_ioLock)
+                {
+                    CleanupTempFile();
+                }
             }
         }
 
@@ -474,11 +479,8 @@ namespace LiteMonitor
             else if (key == "GPU.Fan" && val > settings.RecordedMaxGpuFan) { settings.RecordedMaxGpuFan = val; changed = true; }
             else if (key == "CASE.Fan" && val > settings.RecordedMaxChassisFan) { settings.RecordedMaxChassisFan = val; changed = true; }
             
-            if (changed && (DateTime.Now - settings.LastAutoSaveTime).TotalSeconds > 30)
-            {
-                settings.Save();
-                settings.LastAutoSaveTime = DateTime.Now;
-            }
+            // 调用方持有硬件锁，这里只标记；落盘由 UIController.Tick 在锁外去抖完成
+            if (changed) settings.MaxRecordDirty = true;
         }
     }
 }

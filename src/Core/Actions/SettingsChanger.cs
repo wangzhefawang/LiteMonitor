@@ -33,7 +33,7 @@ namespace LiteMonitor.src.Core.Actions
                 "SessionUploadBytes", "SessionDownloadBytes",
                 
                 // 时间戳
-                "LastAutoSaveTime", "LastAlertTime"
+                "LastAutoSaveTime", "LastAlertTime", "MaxRecordDirty"
             };
 
             var props = typeof(Settings).GetProperties(BindingFlags.Public | BindingFlags.Instance);

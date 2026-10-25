@@ -28,6 +28,13 @@ namespace LiteMonitor.src.WebServer
         
         public static LiteWebServer? Instance { get; private set; }
 
+        // 进程启动时间只取一次，避免每次快照都新建 Process 对象
+        private static readonly Lazy<DateTime> ProcessStartTime = new Lazy<DateTime>(() =>
+        {
+            using var p = Process.GetCurrentProcess();
+            return p.StartTime;
+        });
+
         public bool IsRunning => _isRunning;
         public int CurrentRunningPort => _isRunning ? _currentRunningPort : -1;
 
@@ -121,6 +128,10 @@ namespace LiteMonitor.src.WebServer
                 {
                     AppLog.Warn("Web.Listen", "接受连接失败", ex);
                     if (token.IsCancellationRequested) break;
+
+                    // 退避 1 秒再重试，避免持续出错时空转刷日志
+                    try { await Task.Delay(1000, token); }
+                    catch (OperationCanceledException) { break; }
                 }
             }
         }
@@ -134,6 +145,9 @@ namespace LiteMonitor.src.WebServer
                 writer.WriteEndObject();
                 return;
             }
+
+            // 通知硬件层有人在看快照，forceAll 才会开启
+            hw.NotifyFullSnapshotRequested();
 
             // MonitorItems 是写时复制的：写入方替换引用，已发布的列表不会再被修改，所以这里只读一次引用，不需要加锁
             var items = _cfg.MonitorItems;
@@ -164,7 +178,7 @@ namespace LiteMonitor.src.WebServer
             writer.WriteStartObject("sys");
             writer.WriteString("ip", localIp);
             writer.WriteNumber("port", _currentRunningPort);
-            writer.WriteString("uptime", (DateTime.Now - Process.GetCurrentProcess().StartTime).ToString(@"hh\:mm\:ss"));
+            writer.WriteString("uptime", (DateTime.Now - ProcessStartTime.Value).ToString(@"hh\:mm\:ss"));
             writer.WriteEndObject();
 
             // "items" array

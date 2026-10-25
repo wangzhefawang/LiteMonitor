@@ -46,6 +46,17 @@ namespace LiteMonitor.src.SystemServices
         private double _secondAccumulator = 0;
         private long _secondsCounter = 0;
         private DateTime _lastTrafficTime = DateTime.Now;
+
+        // 周期门：边沿触发，每个周期只触发一次，与刷新间隔无关
+        private readonly IntervalGate _slowScanGate = new IntervalGate(3);      // 3秒一次 (慢速扫描)
+        private readonly IntervalGate _diskBgScanGate = new IntervalGate(10);   // 10秒一次 (磁盘后台扫描)
+
+        // 刷新需求缓存：只缓存依赖配置的 IsAnyEnabled 结果，配置变化时经 InvalidateUpdateRequirements 失效
+        private volatile bool _requirementsDirty = true;
+        private bool _reqCpu, _reqGpu, _reqMem, _reqNetData, _reqBat, _reqDisk, _reqDiskTemp, _reqMobo;
+
+        // 最近一次 Web 快照请求的时间 (Environment.TickCount64)，初始为很久以前
+        private long _lastFullSnapshotTick = long.MinValue / 2;
         #endregion
 
         #region Public Properties
@@ -124,6 +135,12 @@ namespace LiteMonitor.src.SystemServices
 
         public string GetNetworkIP() => _networkManager.GetCurrentIP();
 
+        // 监控项可见性或 Web 开关变化后调用，下一帧重算刷新需求
+        public void InvalidateUpdateRequirements() => _requirementsDirty = true;
+
+        // Web 快照被请求时调用；forceAll 仅在最近 10 秒内有请求时才开启
+        public void NotifyFullSnapshotRequested() => Interlocked.Exchange(ref _lastFullSnapshotTick, Environment.TickCount64);
+
         // ★★★ 新增：允许主程序手动触发驱动检查 (用于解决启动弹窗冲突) ★★★
         public Task SmartCheckDriver() => _driverInstaller.SmartCheckDriver();
 
@@ -190,9 +207,9 @@ namespace LiteMonitor.src.SystemServices
                     _sensorMap.EnsureFresh(_computer, _cfg);
 
                     // 3秒一次 (慢速扫描)
-                    bool isSlowScanTick = (_secondsCounter % 3 == 0); 
+                    bool isSlowScanTick = _slowScanGate.Due(_secondsCounter);
                     // 10秒一次 (磁盘后台扫描)
-                    bool needDiskBgScan = (_secondsCounter % 10 == 0);
+                    bool needDiskBgScan = _diskBgScanGate.Due(_secondsCounter);
 
                     foreach (var hw in _computer.Hardware)
                     {
@@ -424,43 +441,58 @@ namespace LiteMonitor.src.SystemServices
         private (bool ForceAll, bool NeedCpu, bool NeedGpu, bool NeedMem, bool NeedNet, bool NeedDisk, bool NeedBat, bool NeedMobo, double TimeDelta) CheckUpdateRequirements()
         {
             // === [优化开始] 精细化判断更新需求 ===
-        
-            // 1. 获取计数器状态
+
+            // 0.只依赖配置的 IsAnyEnabled 结果走缓存，InvalidateUpdateRequirements 后下一帧重算。
+            //    先清标志再算：重算期间若又被置脏，下一帧会再算一次。
+            if (_requirementsDirty)
+            {
+                _requirementsDirty = false;
+                _reqCpu = _cfg.IsAnyEnabled("CPU");
+                _reqGpu = _cfg.IsAnyEnabled("GPU");
+                _reqMem = _cfg.IsAnyEnabled("MEM");
+                _reqNetData = _cfg.IsAnyEnabled("NET") || _cfg.IsAnyEnabled("DATA");
+                _reqBat = _cfg.IsAnyEnabled("BAT");
+                _reqDiskTemp = _cfg.IsAnyEnabled("DISK.Temp");
+                _reqDisk = _cfg.IsAnyEnabled("DISK");
+                _reqMobo = _cfg.IsAnyEnabled("MOBO") ||
+                    _cfg.IsAnyEnabled("CPU.Fan") ||
+                    _cfg.IsAnyEnabled("CPU.Pump") ||
+                    _cfg.IsAnyEnabled("CASE.Fan");
+            }
+
+            // 1. 获取计数器状态 (计数器初始化完成后会异步翻转，每帧读取)
             bool useCounter = _cfg.UseWinPerCounters && _perfCounterManager.IsInitialized;
-            
+
             // ★★★ [优化] 全量更新判断 ★★★
-            // 如果开启了 WebServer，则需要强制更新所有硬件，因为网页端可能会查看主界面未开启的项目
-            bool forceAll = _cfg.WebServerEnabled;
+            // 开启了 WebServer 且最近 10 秒内有快照请求时，强制更新所有硬件，因为网页端可能会查看主界面未开启的项目
+            bool forceAll = _cfg.WebServerEnabled &&
+                Environment.TickCount64 - Volatile.Read(ref _lastFullSnapshotTick) < 10_000;
 
             // 2. CPU: 总是需要 (因为 LHM 要读温度)
-            bool needCpu = forceAll || _cfg.IsAnyEnabled("CPU");
-            
+            bool needCpu = forceAll || _reqCpu;
+
             // 3. 显卡: 总是需要
-            bool needGpu = forceAll || _cfg.IsAnyEnabled("GPU");
-            
+            bool needGpu = forceAll || _reqGpu;
+
             // 4. ★★★ [优化 1] 内存: 如果走了计数器，就不需要 LHM 轮询了 ★★★
-            bool needMem = forceAll || (_cfg.IsAnyEnabled("MEM") && !useCounter);
-            
+            bool needMem = forceAll || (_reqMem && !useCounter);
+
             // 5. 网络: 保持不变
-            bool needNet = forceAll || _cfg.IsAnyEnabled("NET") || _cfg.IsAnyEnabled("DATA");
-            
+            bool needNet = forceAll || _reqNetData;
+
             // 7. 电池: 只有在开启时才更新
-            bool needBat = forceAll || _cfg.IsAnyEnabled("BAT");
+            bool needBat = forceAll || _reqBat;
 
             // 6. ★★★ [优化 2] 磁盘: 智能判断 ★★★
             // 只有当 (没开计数器 OR 指定了特定盘 OR 需要看温度) 时，才需要 LHM 介入
-            bool needDiskTemp = _cfg.IsAnyEnabled("DISK.Temp");
+            bool needDiskTemp = _reqDiskTemp;
             bool hasSpecificDisk = !string.IsNullOrEmpty(_cfg.PreferredDisk);
-            bool needDiskSpeed = _cfg.IsAnyEnabled("DISK") && (!useCounter || hasSpecificDisk);
+            bool needDiskSpeed = _reqDisk && (!useCounter || hasSpecificDisk);
             bool needDisk = forceAll || needDiskSpeed || needDiskTemp;
 
             // 判断主板更新需求
-            bool needMobo = forceAll ||
-                _cfg.IsAnyEnabled("MOBO") ||
-                _cfg.IsAnyEnabled("CPU.Fan") ||
-                _cfg.IsAnyEnabled("CPU.Pump") ||
-                _cfg.IsAnyEnabled("CASE.Fan");
-            
+            bool needMobo = forceAll || _reqMobo;
+
             return (forceAll, needCpu, needGpu, needMem, needNet, needDisk, needBat, needMobo, 0);
         }
 

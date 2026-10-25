@@ -182,6 +182,8 @@ namespace LiteMonitor.src.Core.Actions
             // ★★★ [新增] 动态检查硬件开启需求 (热切换) ★★★
             // 如果用户开启了风扇/水泵，自动开启 USB 控制器；反之关闭
             HardwareMonitor.Instance?.RefreshHardwareConfig();
+            // 可见性变了，让硬件层下一帧重算刷新需求
+            HardwareMonitor.Instance?.InvalidateUpdateRequirements();
 
             // 重新计算哪些格子要显示 (主界面和任务栏的数据列都会重建)
             ui?.RebuildLayout();
@@ -216,6 +218,9 @@ namespace LiteMonitor.src.Core.Actions
         // =============================================================
         public static void ApplyWebServer(Settings cfg)
         {
+            // Web 开关变化会影响硬件层的刷新范围，让它下一帧重算刷新需求
+            HardwareMonitor.Instance?.InvalidateUpdateRequirements();
+
             var server = LiteWebServer.Instance;
             if (server != null)
             {

@@ -150,6 +150,8 @@ namespace LiteMonitor
         [JsonIgnore] public long SessionUploadBytes { get; set; } = 0;
         [JsonIgnore] public long SessionDownloadBytes { get; set; } = 0;
         [JsonIgnore] public DateTime LastAutoSaveTime { get; set; } = DateTime.MinValue;
+        // 最大值记录有新内容待保存；由 UpdateMaxRecord 置位，UIController.Tick 去抖后落盘
+        [JsonIgnore] public bool MaxRecordDirty { get; set; } = false;
 
         public Dictionary<string, string> GroupAliases { get; set; } = new Dictionary<string, string>();
         // 运行期该列表采用写时复制：增删或排序要先复制、修改副本、再整体赋值给本属性；
