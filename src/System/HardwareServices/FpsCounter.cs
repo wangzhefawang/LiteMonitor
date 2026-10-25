@@ -82,6 +82,9 @@ namespace LiteMonitor.src.SystemServices
         // 奥运会窗口大小：6次采样（平滑微小抖动）
         private const int OLYMPIC_SIZE = 6;
 
+        // PresentMon 进程活着但连续没有输出超过此秒数才重启（进程已退出则立即重启）
+        private const int SILENT_RESTART_SECONDS = 60;
+
         // 文件路径常量
         private static readonly string BaseDir = AppDomain.CurrentDomain.BaseDirectory; // 使用 AppDomain 确保准确
         // ★★★ [修改] 统一路径到 resources/assets ★★★
@@ -273,9 +276,11 @@ namespace LiteMonitor.src.SystemServices
             // 只有在应该运行（有请求）的情况下才检查僵死状态
             if (_isRunning && (DateTime.Now - _lastAccessTime).TotalSeconds <= 5)
             {
-                // 判断服务是否异常：超过3秒没有收到数据或进程已退出
-                bool isDead = (DateTime.Now - _lastDataTime).TotalSeconds > 3;
-                if (_presentMonProc == null || _presentMonProc.HasExited) isDead = true;
+                // 判断服务是否异常：进程已退出立即重启；进程活着但连续 60 秒没有输出才算僵死
+                // （桌面静止时 PresentMon 本来就没有输出，阈值太短会白白反复重启）
+                var proc = _presentMonProc;
+                bool isDead = (DateTime.Now - _lastDataTime).TotalSeconds > SILENT_RESTART_SECONDS;
+                if (proc == null || proc.HasExited) isDead = true;
                 
                 // 异常时重启服务
                 if (isDead) Task.Run(() => RestartService());
@@ -342,27 +347,32 @@ namespace LiteMonitor.src.SystemServices
                 };
 
                 // 启动 PresentMon 进程
-                _presentMonProc = Process.Start(psi);
-                if (_presentMonProc == null) return;
+                var proc = Process.Start(psi);
+                if (proc == null) return;
+
+                // 释放上一个（已退出或已被终止的）进程对象，再换上新的
+                _presentMonProc?.Dispose();
+                _presentMonProc = proc;
 
                 // 更新服务状态
                 _isRunning = true;
-                _lastDataTime = DateTime.Now; 
+                _lastDataTime = DateTime.Now;
                 // 忽略错误输出
-                _presentMonProc.ErrorDataReceived += (s, e) => { };
-                _presentMonProc.BeginErrorReadLine();
+                proc.ErrorDataReceived += (s, e) => { };
+                proc.BeginErrorReadLine();
 
-                // 监控进程退出状态
-                Task.Run(async () => { await _presentMonProc.WaitForExitAsync(); _isRunning = false; });
+                // 监控进程退出状态（捕获本次启动的进程实例，重启后不会误读新进程）
+                Task.Run(async () => { await proc.WaitForExitAsync(); _isRunning = false; });
 
-                // 异步处理 PresentMon 输出数据
+                // 异步处理 PresentMon 输出数据（同样只读本次启动的进程实例）
                 Task.Run(async () =>
                 {
                     try
                     {
-                        while (!_presentMonProc.StandardOutput.EndOfStream)
+                        var reader = proc.StandardOutput;
+                        while (!reader.EndOfStream)
                         {
-                            string? line = await _presentMonProc.StandardOutput.ReadLineAsync();
+                            string? line = await reader.ReadLineAsync();
                             if (!string.IsNullOrWhiteSpace(line)) 
                             {
                                 // 解析输出数据
@@ -443,7 +453,16 @@ namespace LiteMonitor.src.SystemServices
                 _processFrameCounts[pid] = 0; // 读后归零，准备下一个周期
 
                 // 获取进程名称，过滤不需要监控的进程
-                string pName = GetProcessName(pid);
+                if (!TryGetProcessName(pid, out string pName) && currentCount == 0)
+                {
+                    // 进程已退出且本周期没有新帧：清掉该 PID 的全部记录，不再每周期重复查询已死的 PID
+                    _calculatedProcessFps.TryRemove(pid, out _);
+                    _accumulatorHistory.TryRemove(pid, out _);
+                    _olympicHistory.TryRemove(pid, out _);
+                    _processNameCache.TryRemove(pid, out _);
+                    _processFrameCounts.TryRemove(new KeyValuePair<int, int>(pid, 0)); // 仅当值仍为 0 才移除，避免丢掉刚到的帧
+                    continue;
+                }
                 if (ExcludedProcesses.Contains(pName))
                 {
                     _calculatedProcessFps.TryRemove(pid, out _);
@@ -514,9 +533,10 @@ namespace LiteMonitor.src.SystemServices
                     _processNameCache.TryRemove(pid, out _); // ★★★ 同步清理进程名缓存 ★★★
                     if (currentCount == 0 && totalCount == 0) 
                     {
-                        // 完全没有帧数据，清理历史记录
+                        // 完全没有帧数据，清理历史记录和帧计数（再出帧时 ParseLine 会重新登记）
                         _accumulatorHistory.TryRemove(pid, out _);
                         _olympicHistory.TryRemove(pid, out _);
+                        _processFrameCounts.TryRemove(new KeyValuePair<int, int>(pid, 0));
                     }
                 }
                 else 
@@ -534,15 +554,36 @@ namespace LiteMonitor.src.SystemServices
         /// <returns>进程名称，失败时返回 "Unknown"</returns>
         private string GetProcessName(int pid)
         {
-            if (_processNameCache.TryGetValue(pid, out string? cachedName)) return cachedName;
+            TryGetProcessName(pid, out string name);
+            return name;
+        }
 
-            try 
-            { 
-                string name = Process.GetProcessById(pid).ProcessName; 
+        /// <summary>
+        /// 获取进程名称（带缓存），并告知查询是否成功
+        /// </summary>
+        /// <param name="pid">进程 PID</param>
+        /// <param name="name">进程名称，失败时为 "Unknown"</param>
+        /// <returns>查询成功返回 true；进程已不存在等失败情况返回 false</returns>
+        private bool TryGetProcessName(int pid, out string name)
+        {
+            if (_processNameCache.TryGetValue(pid, out string? cachedName))
+            {
+                name = cachedName;
+                return true;
+            }
+
+            try
+            {
+                using var p = Process.GetProcessById(pid);
+                name = p.ProcessName;
                 _processNameCache.TryAdd(pid, name);
-                return name;
-            } 
-            catch { return "Unknown"; }
+                return true;
+            }
+            catch
+            {
+                name = "Unknown";
+                return false;
+            }
         }
 
         /// <summary>
@@ -556,13 +597,14 @@ namespace LiteMonitor.src.SystemServices
             try
             {
                 // 1. 优先终止所有名为 LiteMonitorFPS 的进程 (最重要)
-                foreach (var p in Process.GetProcessesByName("LiteMonitorFPS")) { try { p.Kill(); } catch { } }
-                
+                foreach (var p in Process.GetProcessesByName("LiteMonitorFPS")) { using (p) { try { p.Kill(); } catch { } } }
+
                 // 2. 停止 LiteMonitorFPS 会话
                 // 仅在 CLR 未关闭时尝试调用 logman，避免在程序退出极晚期引发异常
                 if (!Environment.HasShutdownStarted)
                 {
-                    Process.Start(new ProcessStartInfo { FileName = "logman", Arguments = $"stop {SESSION_NAME} -ets", UseShellExecute = false, CreateNoWindow = true })?.WaitForExit(100);
+                    using var logman = Process.Start(new ProcessStartInfo { FileName = "logman", Arguments = $"stop {SESSION_NAME} -ets", UseShellExecute = false, CreateNoWindow = true });
+                    logman?.WaitForExit(100);
                 }
             }
             catch { }
@@ -585,12 +627,17 @@ namespace LiteMonitor.src.SystemServices
         /// </summary>
         public void Dispose()
         {
-            try { 
-                // 终止 PresentMon 进程并清理僵尸进程
-                _presentMonProc?.Kill(); 
-                ForceKillZombies(); 
-                _isRunning = false; // 同步重置状态
-            } catch { }
+            // 三步各自处理：Kill 失败（进程已退出等）不能跳过后面的释放和清理
+            var proc = _presentMonProc;
+            try { proc?.Kill(); } catch { }
+
+            // 释放进程对象并清空字段，避免重启后残留旧实例
+            proc?.Dispose();
+            _presentMonProc = null;
+
+            // 清理僵尸进程
+            ForceKillZombies();
+            _isRunning = false; // 同步重置状态
         }
     }
 }

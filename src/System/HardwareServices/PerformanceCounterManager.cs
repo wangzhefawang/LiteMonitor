@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
@@ -34,6 +35,13 @@ namespace LiteMonitor.src.SystemServices
         // --- 静态基准数据 (启动时获取一次即可) ---
         private float _cpuBaseFreq = 0;   // CPU 基准频率 (MHz)
         private float _totalMemoryMB = 0; // 物理内存总量 (MB)
+
+        // --- 失效计数器处理 ---
+        // 连续失败达到此次数就停用该计数器（释放并置 null），调用方自动走 LHM 回退
+        private const int MaxConsecutiveFailures = 5;
+        // 每个计数器的连续失败次数；GetStartupValue 在硬件锁之外读取，所以单独加锁保护
+        private readonly Dictionary<PerformanceCounter, int> _failCounts = new();
+        private readonly object _failLock = new();
 
         /// <summary>
         /// 标记计数器是否已完成初始化和预热。
@@ -103,18 +111,18 @@ namespace LiteMonitor.src.SystemServices
                     // 必须在这里先读一次，这样用户在 UI 上第一次看到数据时就是有值的。
                     // [Fix] 使用 SafeRead 代替直接调用 NextValue，防止某个计数器崩溃导致整个初始化失败 (#268)
                     
-                    SafeRead(_cpuLoadCounter);
-                    SafeRead(_cpuFreqCounter);
-                    SafeRead(_ramAvailableCounter);
-                    SafeRead(_diskReadCounter);
-                    SafeRead(_diskWriteCounter);
-                    SafeRead(_diskActiveCounter);
-                    SafeRead(_uptimeCounter);
-                    
-                    SafeRead(_smbClientReadCounter);
-                    SafeRead(_smbClientWriteCounter);
-                    SafeRead(_smbServerReadCounter);
-                    SafeRead(_smbServerWriteCounter);
+                    SafeRead(ref _cpuLoadCounter);
+                    SafeRead(ref _cpuFreqCounter);
+                    SafeRead(ref _ramAvailableCounter);
+                    SafeRead(ref _diskReadCounter);
+                    SafeRead(ref _diskWriteCounter);
+                    SafeRead(ref _diskActiveCounter);
+                    SafeRead(ref _uptimeCounter);
+
+                    SafeRead(ref _smbClientReadCounter);
+                    SafeRead(ref _smbClientWriteCounter);
+                    SafeRead(ref _smbServerReadCounter);
+                    SafeRead(ref _smbServerWriteCounter);
 
                     IsInitialized = true;
                 }
@@ -183,7 +191,7 @@ namespace LiteMonitor.src.SystemServices
 
         public float? GetCpuLoad()
         {
-            var val = SafeRead(_cpuLoadCounter);
+            var val = SafeRead(ref _cpuLoadCounter);
             // [Fix] Utility 计数器在睿频时可能超过 100%，需截断以匹配任务管理器行为
             return val > 100f ? 100f : val;
         }
@@ -192,7 +200,7 @@ namespace LiteMonitor.src.SystemServices
         {
             // 算法：基准频率 * (性能百分比 / 100)
             // 例子：基准 3.0GHz * 150% = 4.5GHz
-            var percent = SafeRead(_cpuFreqCounter);
+            var percent = SafeRead(ref _cpuFreqCounter);
             if (percent.HasValue && _cpuBaseFreq > 0)
             {
                 return _cpuBaseFreq * (percent.Value / 100.0f);
@@ -206,7 +214,7 @@ namespace LiteMonitor.src.SystemServices
         /// </summary>
         public (float? Load, float? UsedGB) GetMemoryData()
         {
-            var availableMB = SafeRead(_ramAvailableCounter);
+            var availableMB = SafeRead(ref _ramAvailableCounter);
             if (availableMB.HasValue && _totalMemoryMB > 0)
             {
                 float usedMB = _totalMemoryMB - availableMB.Value;
@@ -217,10 +225,10 @@ namespace LiteMonitor.src.SystemServices
             return (null, null);
         }
 
-        public float? GetDiskRead() => SafeRead(_diskReadCounter);
-        public float? GetDiskWrite() => SafeRead(_diskWriteCounter);
-        public float? GetDiskActive() => SafeRead(_diskActiveCounter);
-        public float? GetUptime() => SafeRead(_uptimeCounter);
+        public float? GetDiskRead() => SafeRead(ref _diskReadCounter);
+        public float? GetDiskWrite() => SafeRead(ref _diskWriteCounter);
+        public float? GetDiskActive() => SafeRead(ref _diskActiveCounter);
+        public float? GetUptime() => SafeRead(ref _uptimeCounter);
 
         /// <summary>
         /// 获取本周期内估算的 SMB 流量增量 (含协议开销补偿)
@@ -254,33 +262,61 @@ namespace LiteMonitor.src.SystemServices
 
             // 1. Client (Redirector)
             // Upload = Transmitted
-            if (_smbClientWriteCounter != null) up += (SafeRead(_smbClientWriteCounter) ?? 0);
+            if (_smbClientWriteCounter != null) up += (SafeRead(ref _smbClientWriteCounter) ?? 0);
             // Download = Received
-            if (_smbClientReadCounter != null) down += (SafeRead(_smbClientReadCounter) ?? 0);
+            if (_smbClientReadCounter != null) down += (SafeRead(ref _smbClientReadCounter) ?? 0);
 
             // 2. Server
             // Upload = Transmitted (别人下载我的文件)
-            if (_smbServerWriteCounter != null) up += (SafeRead(_smbServerWriteCounter) ?? 0);
+            if (_smbServerWriteCounter != null) up += (SafeRead(ref _smbServerWriteCounter) ?? 0);
             // Download = Received (别人传文件给我)
-            if (_smbServerReadCounter != null) down += (SafeRead(_smbServerReadCounter) ?? 0);
+            if (_smbServerReadCounter != null) down += (SafeRead(ref _smbServerReadCounter) ?? 0);
 
             return (up, down);
         }
 
         /// <summary>
         /// 包裹 try-catch 的读取，防止运行时因为系统组件重置导致的崩溃
+        /// <para>连续失败 5 次后停用该计数器：写一次日志、释放并把 <paramref name="field"/> 置 null，此后各 Get* 直接返回 null。</para>
         /// </summary>
-        private float? SafeRead(PerformanceCounter? pc)
+        private float? SafeRead(ref PerformanceCounter? field)
         {
+            var pc = field;
             if (pc == null) return null;
             try
             {
                 var val = pc.NextValue();
+                lock (_failLock) _failCounts.Remove(pc); // 成功一次就清零连续失败计数
                 return val;
             }
-            catch
+            catch (Exception ex)
             {
-                return null; 
+                bool disable = false;
+                lock (_failLock)
+                {
+                    // 字段已被其他线程换掉（已停用），不重复统计
+                    if (!ReferenceEquals(field, pc)) return null;
+
+                    _failCounts.TryGetValue(pc, out int fails);
+                    fails++;
+                    if (fails >= MaxConsecutiveFailures)
+                    {
+                        _failCounts.Remove(pc);
+                        field = null;
+                        disable = true;
+                    }
+                    else
+                    {
+                        _failCounts[pc] = fails;
+                    }
+                }
+
+                if (disable)
+                {
+                    AppLog.Warn("PerfCounter", $"性能计数器连续失败，已停用：{pc.CategoryName}/{pc.CounterName}", ex);
+                    pc.Dispose();
+                }
+                return null;
             }
         }
 

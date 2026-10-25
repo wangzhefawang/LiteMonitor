@@ -26,13 +26,16 @@ namespace LiteMonitor.src.SystemServices
             public ISensor? CachedDownSensor;
         }
         private readonly Dictionary<IHardware, NetworkState> _netStates = new();
-        
+        // _netStates 的所有读写都必须持有此锁：AccumulateTraffic 在硬件锁内写入，GetCurrentIP 会在其他线程读取
+        private readonly object _statesLock = new();
+
         // 网络智能缓存
         private IHardware? _cachedNetHw;
         private DateTime _lastNetScan = DateTime.MinValue;
         private readonly DateTime _startTime = DateTime.Now; // 启动时间
         private static string _staticIPCache = "";// [修改] 增加IP静态缓存，切换主题/重启服务时不丢失，解决闪烁问题
         private static DateTime _lastIPCheckTime = DateTime.MinValue; // 上次检查IP的时间
+        private static DateTime _lastFallbackScanTime = DateTime.MinValue; // 上次兜底枚举全部网卡的时间（限频用，网络变更时清除）
         private volatile bool _shouldResetAdapters = false; // [Fix #287] 网络变更标记
 
         // ★★★ 依赖注入：性能计数器 (用于获取 SMB 流量) ★★★
@@ -46,14 +49,15 @@ namespace LiteMonitor.src.SystemServices
             // [Fix #287] 监听网络地址变更事件，强制刷新 IP 和 网卡缓存
             // 当用户切换 WIFI 或插拔网线时，IP地址和网卡实例都会失效，必须重置
             NetworkChange.NetworkAddressChanged += (s, e) => {
-                _staticIPCache = null; 
+                _staticIPCache = null;
+                _lastFallbackScanTime = DateTime.MinValue; // 网络变了，兜底枚举可以立即重试
                 _shouldResetAdapters = true;
             };
         }
 
         public void ClearCache()
         {
-            _netStates.Clear();
+            lock (_statesLock) _netStates.Clear();
             _cachedNetHw = null;
         }
 
@@ -90,19 +94,16 @@ namespace LiteMonitor.src.SystemServices
             // 这会迫使 MatchNativeNetworkAdapter 重新寻找最新的 NetworkInterface 实例 (获取正确的新IP)
             if (_shouldResetAdapters)
             {
-                try
+                // 锁内只复制状态列表，锁外再改字段
+                NetworkState[] allStates;
+                lock (_statesLock) allStates = _netStates.Values.ToArray();
+
+                foreach (var state in allStates)
                 {
-                    foreach (var state in _netStates.Values)
-                    {
-                        state.NativeAdapter = null;
-                        state.LastMatchAttempt = DateTime.MinValue; // 允许立即重新匹配
-                    }
-                    _shouldResetAdapters = false;
+                    state.NativeAdapter = null;
+                    state.LastMatchAttempt = DateTime.MinValue; // 允许立即重新匹配
                 }
-                catch 
-                { 
-                    // 忽略并发修改异常，保留标志位下次重试
-                }
+                _shouldResetAdapters = false;
             }
 
             // 1. 缓存保护：只有当缓存了【有效IP】且距离上次检查不到 30 秒时，才直接返回
@@ -115,26 +116,38 @@ namespace LiteMonitor.src.SystemServices
             string foundIP = null;
 
             // 2. 策略A：直接从当前锁定的硬件中获取 (这是最直接的方式)
-            try 
+            try
             {
                 // ★★★ 核心修复：即使 _cachedNetHw 为空（还没锁定网卡），也要尝试从 _netStates 中寻找已匹配 NativeAdapter 的网卡 ★★★
                 // 之前的 bug 是：网速跳动说明 MatchNativeNetworkAdapter 成功了，_netStates 里有 NativeAdapter，
                 // 但 _cachedNetHw 还没来得及更新，导致这里直接跳过。
-                
-                // 如果已锁定，优先用锁定的
-                if (_cachedNetHw != null && _netStates.TryGetValue(_cachedNetHw, out var state) && state.NativeAdapter != null)
+
+                // 锁内只复制需要的状态，锁外再取 IP（GetIPv4FromAdapter 较慢，不能占着锁）
+                NetworkState? lockedState = null;
+                NetworkState[] knownStates;
+                lock (_statesLock)
                 {
-                     foundIP = GetIPv4FromAdapter(state.NativeAdapter);
+                    var cachedHw = _cachedNetHw;
+                    if (cachedHw != null) _netStates.TryGetValue(cachedHw, out lockedState);
+                    knownStates = _netStates.Values.ToArray();
                 }
-                
+
+                // 如果已锁定，优先用锁定的
+                var lockedAdapter = lockedState?.NativeAdapter;
+                if (lockedAdapter != null)
+                {
+                     foundIP = GetIPv4FromAdapter(lockedAdapter);
+                }
+
                 // 如果没锁定（或锁定的没取到），遍历所有已知状态的网卡 (这些网卡都是有流量活动的)
                 if (string.IsNullOrEmpty(foundIP))
                 {
-                    foreach (var kv in _netStates)
+                    foreach (var knownState in knownStates)
                     {
-                        if (kv.Value.NativeAdapter != null)
+                        var adapter = knownState.NativeAdapter;
+                        if (adapter != null)
                         {
-                            string ip = GetIPv4FromAdapter(kv.Value.NativeAdapter);
+                            string ip = GetIPv4FromAdapter(adapter);
                             if (!string.IsNullOrEmpty(ip))
                             {
                                 foundIP = ip;
@@ -146,9 +159,13 @@ namespace LiteMonitor.src.SystemServices
             }
             catch { }
 
-            // 3. 策略B (兜底)：如果上面没拿到，才主动遍历系统网卡 (只跑一次)
+            // 3. 策略B (兜底)：如果上面没拿到，才主动遍历系统网卡 (30 秒内最多一次)
             if (string.IsNullOrEmpty(foundIP))
             {
+                // 限频：窗口内直接返回缓存结果（包括空结果），断网时不会每次调用都枚举全部网卡
+                if ((DateTime.Now - _lastFallbackScanTime).TotalSeconds < 30) return _staticIPCache;
+                _lastFallbackScanTime = DateTime.Now;
+
                 try
                 {
                     var nics = NetworkInterface.GetAllNetworkInterfaces();
@@ -324,10 +341,14 @@ namespace LiteMonitor.src.SystemServices
         private void AccumulateTraffic(IHardware hw, Settings cfg, double seconds)
         {
             // 1. 获取或创建当前硬件的独立状态
-            if (!_netStates.TryGetValue(hw, out var state))
+            NetworkState? state;
+            lock (_statesLock)
             {
-                state = new NetworkState();
-                _netStates[hw] = state;
+                if (!_netStates.TryGetValue(hw, out state))
+                {
+                    state = new NetworkState();
+                    _netStates[hw] = state;
+                }
             }
 
             long finalUp = 0;
