@@ -201,7 +201,7 @@ namespace LiteMonitor
                     cts.CancelAfter(3000); // 最大等待 3 秒（连接+读取全部）
 
                     // 构造真正带连接超时的 HttpRequest
-                    var request = new HttpRequestMessage(HttpMethod.Get, url);
+                    using var request = new HttpRequestMessage(HttpMethod.Get, url);
 
                     var task = http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token);
 
@@ -211,14 +211,14 @@ namespace LiteMonitor
                     if (finished != task)
                         throw new TimeoutException("Connection timeout");
 
-                    var resp = await task;
+                    using var resp = await task;
 
                     if (!resp.IsSuccessStatusCode)
                         throw new Exception("Bad status");
 
                     string json = await resp.Content.ReadAsStringAsync(cts.Token);
 
-                    var doc = JsonDocument.Parse(json);
+                    using var doc = JsonDocument.Parse(json);
 
                     string latest = doc.RootElement.GetProperty("version").GetString()!;
                     string log = doc.RootElement.GetProperty("changelog").GetString()!;

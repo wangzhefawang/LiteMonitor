@@ -127,7 +127,7 @@ namespace LiteMonitor.src.Plugins
             }
             else
             {
-                var keysToRemove = _stepCache.Keys.Where(k => k.StartsWith(instanceId)).ToList();
+                var keysToRemove = _stepCache.Keys.Where(k => k.StartsWith(instanceId + "_", StringComparison.Ordinal) || k.StartsWith(instanceId + ".", StringComparison.Ordinal)).ToList();
                 foreach (var k in keysToRemove) _stepCache.TryRemove(k, out _);
             }
         }
@@ -289,11 +289,12 @@ namespace LiteMonitor.src.Plugins
                 bool hit = false;
                 string resultRaw = "";
 
-                if (step.CacheMinutes > 0)
+                if (step.CacheMinutes != 0)
                 {
                     if (_stepCache.TryGetValue(cacheKey, out var cached))
                     {
-                        if (DateTime.Now - cached.Timestamp < TimeSpan.FromMinutes(step.CacheMinutes))
+                        // 负数表示永不过期，只有 CacheMinutes > 0 才判断过期
+                        if (step.CacheMinutes < 0 || DateTime.Now - cached.Timestamp < TimeSpan.FromMinutes(step.CacheMinutes))
                         {
                             resultRaw = cached.RawResponse;
                             hit = true;

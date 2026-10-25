@@ -131,13 +131,13 @@ namespace LiteMonitor.src.Plugins
             if (string.IsNullOrEmpty(instanceId)) return;
             
             // 1. Remove raw values injected by plugin (Key starts with instanceId)
-            InfoService.Instance.RemoveDataByPrefix(instanceId);
+            InfoService.Instance.RemoveDataByPrefix(instanceId + ".");
             
             // 2. Remove dynamic properties (Label, ShortLabel, etc.)
             // Keys are like PROP.Label.DASH.{instanceId}.{OutputKey}
-            InfoService.Instance.RemoveDataByPrefix("PROP.Label.DASH." + instanceId);
-            InfoService.Instance.RemoveDataByPrefix("PROP.ShortLabel.DASH." + instanceId);
-            InfoService.Instance.RemoveDataByPrefix("PROP.Unit.DASH." + instanceId); // If we add Unit support later
+            InfoService.Instance.RemoveDataByPrefix("PROP.Label.DASH." + instanceId + ".");
+            InfoService.Instance.RemoveDataByPrefix("PROP.ShortLabel.DASH." + instanceId + ".");
+            InfoService.Instance.RemoveDataByPrefix("PROP.Unit.DASH." + instanceId + "."); // If we add Unit support later
         }
 
         public void Reload(Settings cfg)

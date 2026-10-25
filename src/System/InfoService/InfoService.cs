@@ -184,7 +184,7 @@ namespace LiteMonitor.src.SystemServices.InfoService
             if (string.IsNullOrEmpty(prefix)) return;
             lock (_lock)
             {
-                var keysToRemove = _data.Keys.Where(k => k.StartsWith(prefix)).ToList();
+                var keysToRemove = _data.Keys.Where(k => k.StartsWith(prefix, StringComparison.Ordinal)).ToList();
                 foreach (var k in keysToRemove)
                 {
                     _data.Remove(k);
