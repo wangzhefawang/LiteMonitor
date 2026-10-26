@@ -17,8 +17,6 @@ namespace LiteMonitor.src.SystemServices
 
         // 边沿触发的周期门：每个周期只执行一次，与刷新间隔无关
         private static readonly IntervalGate _trafficGate = CreateGate(60, 5);
-        private static readonly IntervalGate _gcGate = CreateGate(180, 30);
-        private static readonly IntervalGate _trimGate = CreateGate(300, 45);
 
         /// <summary>
         /// 创建保留错峰的周期门：偏移 = 周期 - 余数，使 seconds % 周期 到达余数时进入新周期，
@@ -89,7 +87,7 @@ namespace LiteMonitor.src.SystemServices
         }
 
         /// <summary>
-        /// 执行定时维护任务 (流量保存、GC 优化、内存修剪)
+        /// 执行定时维护任务 (流量保存)
         /// </summary>
         /// <param name="secondsCounter">系统运行秒数计数器</param>
         public static void RunMaintenanceTasks(long secondsCounter)
@@ -98,27 +96,6 @@ namespace LiteMonitor.src.SystemServices
             if (_trafficGate.Due(secondsCounter))
             {
                 TrafficLogger.Save();
-            }
-
-            // 2. 内存软清理: 每 180 秒 (Offset 30s)
-            if (_gcGate.Due(secondsCounter))
-            {
-                GC.Collect(2, GCCollectionMode.Optimized);
-            }
-
-            // 3. 内存硬清理: 每 300 秒 (5分钟) (Offset 45s)
-            if (_trimGate.Due(secondsCounter))
-            {
-                try
-                {
-                    using var proc = Process.GetCurrentProcess();
-                    // 阈值 30MB，确保极致轻量
-                    if (proc.WorkingSet64 > 30 * 1024 * 1024) 
-                    {
-                        EmptyWorkingSet(proc.Handle);
-                    }
-                }
-                catch { }
             }
         }
     }

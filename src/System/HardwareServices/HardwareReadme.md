@@ -61,7 +61,7 @@ graph TD
 | **PerformanceCounterManager.cs** | **系统计数器封装**。封装 Windows `PerformanceCounter` API。提供比 LHM 更快、更稳定的 CPU/网络/磁盘数据读取方式，是 NetworkManager 的底层依赖。 |
 | **DriverInstaller.cs** | **驱动加载器**。负责安全地安装和加载 `WinRing0.sys` 或 `InpOut` 驱动，解决权限问题和文件占用问题，确保 LHM 能读取底层寄存器。 |
 | **HardwareScanner.cs** | **UI 辅助工具**。提供静态辅助方法，用于扫描并列出当前系统中的网卡、磁盘、风扇列表，供设置界面的下拉菜单使用。 |
-| **SystemOptimizer.cs** | **内存优化**。提供 `EmptyWorkingSet` 等系统级 API 调用，用于定期修剪程序的内存占用，保持轻量化。 |
+| **SystemOptimizer.cs** | **内存优化**。提供 `EmptyWorkingSet` 等系统级 API 调用，用于启动后和用户手动清理时修剪内存。 |
 
 ## 4. 关键设计原则
 
