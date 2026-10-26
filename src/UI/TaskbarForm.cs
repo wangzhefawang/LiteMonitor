@@ -24,6 +24,8 @@ namespace LiteMonitor
         private ContextMenuStrip? _currentMenu;
         private DateTime _lastFindHandleTime = DateTime.MinValue;
         private string _lastLayoutSignature = "";
+        private long _lastThemeCheckTick;
+        private int _lastPaintSignature;
         private readonly TaskbarTooltipHelper _tooltipHelper;
         
         // 公开属性
@@ -65,12 +67,15 @@ namespace LiteMonitor
             _bizHelper.AttachToTaskbar();
             _winHelper.ApplyLayeredStyle(_bizHelper.TransparentKey, _cfg.TaskbarClickThrough);
 
-            _timer.Interval = Math.Max(_cfg.RefreshMs, 60);
+            // 巡检句柄、父窗口、任务栏矩形、位置和主题，与刷新间隔无关；重画由 UIController.FrameUpdated 驱动
+            _timer.Interval = 1000;
             _timer.Tick += (_, __) => Tick();
             _timer.Start();
 
             // 鼠标悬浮提示初始化
             _tooltipHelper = new TaskbarTooltipHelper(this, _cfg, _ui);
+
+            _ui.FrameUpdated += OnFrameUpdated;
 
             Tick();
         }
@@ -94,9 +99,6 @@ namespace LiteMonitor
                 _bizHelper.UpdatePlacement(Width);
             }
 
-            // 刷新间隔可能已被修改，同步给定时器 (_timer 是字段初始化器创建的，构造函数里首次调用时已存在)
-            _timer.Interval = Math.Max(_cfg.RefreshMs, 60);
-
             Invalidate();
         }
 
@@ -104,6 +106,7 @@ namespace LiteMonitor
         {
             if (disposing)
             {
+                _ui.FrameUpdated -= OnFrameUpdated;
                 _winHelper?.RestoreTaskbar();
                 _timer.Stop();
                 _timer.Dispose();
@@ -186,8 +189,27 @@ namespace LiteMonitor
                 _lastFindHandleTime = DateTime.Now;
             }
 
-            if (Math.Abs(Environment.TickCount) % 5000 < _cfg.RefreshMs) _bizHelper.CheckTheme();
+            // 按真实时间每 5 秒一次，原来的取模节流在刷新间隔大于 1 秒时几乎每次都读注册表
+            long now = Environment.TickCount64;
+            if (now - _lastThemeCheckTick >= 5000)
+            {
+                _lastThemeCheckTick = now;
+                _bizHelper.CheckTheme();
+            }
 
+            RefreshView(patrol: true);
+        }
+
+        private void OnFrameUpdated(bool isDataTick)
+        {
+            RefreshView(patrol: false);
+
+            // 悬浮提示读的是数值，只在数据刷新后更新；动画帧不刷新提示框
+            if (isDataTick) _tooltipHelper.UpdateContent();
+        }
+
+        private void RefreshView(bool patrol)
+        {
             // [Fix Part 1] 防空数据保护
             // 使用临时变量接收，先判断数据有效性，再赋值给成员变量 _cols
             // 防止在 UI 重建期间(RebuildLayout)获取到空列表导致任务栏闪烁或清空
@@ -196,14 +218,19 @@ namespace LiteMonitor
             
             _cols = nextCols; // 确认有效后再更新引用
 
-            _bizHelper.UpdateTaskbarRect(); 
-            
+            // 任务栏矩形只在巡检时查，动画帧用缓存的高度
+            if (patrol) _bizHelper.UpdateTaskbarRect();
+
+            bool layoutChanged = false;
+
             // [Fix Part 2] 布局变更检测
             if (_bizHelper.IsVertical())
             {
                 // 垂直模式逻辑简单且无测量开销，直接重算即可
+                var before = Size;
                 _bizHelper.BuildVerticalLayout(_cols);
                 _lastLayoutSignature = "vertical";
+                layoutChanged = Size != before;
             }
             else
             {
@@ -223,14 +250,47 @@ namespace LiteMonitor
                     Height = _bizHelper.Height;
                     
                     _lastLayoutSignature = currentSig;
+                    layoutChanged = true;
                 }
             }
-            
-            _bizHelper.UpdatePlacement(Width);
-            
-            _tooltipHelper.UpdateContent();
 
-            Invalidate();
+            // 巡检每秒至少定位一次，SetWindowPosMemo 的 5 秒强制重设依赖这一点；宽度变化时立即定位
+            if (patrol || layoutChanged) _bizHelper.UpdatePlacement(Width);
+
+            int sig = ComputePaintSignature();
+            if (layoutChanged || sig != _lastPaintSignature)
+            {
+                _lastPaintSignature = sig;
+                Invalidate();
+            }
+        }
+
+        // 与 TaskbarRenderer 绘制时读取的量一致，签名不变则像素不变
+        private int ComputePaintSignature()
+        {
+            if (_cols == null) return 0;
+
+            var h = new HashCode();
+            h.Add(_bizHelper.LastIsLightTheme);
+
+            foreach (var col in _cols)
+            {
+                AddItemToSignature(ref h, col.Top);
+                AddItemToSignature(ref h, col.Bottom);
+            }
+
+            return h.ToHashCode();
+        }
+
+        private static void AddItemToSignature(ref HashCode h, MetricItem? item)
+        {
+            if (item == null) return;
+
+            // GetFormattedText 会更新 CachedColorState，必须先调用
+            string text = item.GetFormattedText(true);
+            h.Add(item.ShortLabel);
+            h.Add(text);
+            h.Add(item.CachedColorState);
         }
 
         protected override void OnPaintBackground(PaintEventArgs e)
