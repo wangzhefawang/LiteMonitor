@@ -49,6 +49,7 @@ namespace LiteMonitor.src.Core
         // 3. GDI+ Resource Cache (Brushes & Fonts)
         // ============================================================
         private static readonly Dictionary<string, SolidBrush> _brushCache = new(16);
+        private static readonly Dictionary<int, SolidBrush> _colorBrushCache = new(16);
         private static readonly Dictionary<string, Pen> _penCache = new(16);
         private static readonly Dictionary<string, Font> _fontCache = new(16);
         private static readonly object _brushLock = new object();
@@ -102,6 +103,26 @@ namespace LiteMonitor.src.Core
             }
         }
 
+        // 按 Color 取缓存画刷，绘制路径上避免每帧 new SolidBrush；调用方不得 Dispose 返回的画刷
+        public static SolidBrush GetBrush(Color color)
+        {
+            int key = color.ToArgb();
+            lock (_brushLock)
+            {
+                if (!_colorBrushCache.TryGetValue(key, out var br))
+                {
+                    if (_colorBrushCache.Count >= MAX_BRUSH_CACHE)
+                    {
+                        foreach (var b in _colorBrushCache.Values) b.Dispose();
+                        _colorBrushCache.Clear();
+                    }
+                    br = new SolidBrush(color);
+                    _colorBrushCache[key] = br;
+                }
+                return br;
+            }
+        }
+
         public static Font GetFont(string familyName, float size, bool bold)
         {
             string key = $"{familyName}_{size}_{bold}";
@@ -130,6 +151,9 @@ namespace LiteMonitor.src.Core
             {
                 foreach (var b in _brushCache.Values) b.Dispose();
                 _brushCache.Clear();
+
+                foreach (var b in _colorBrushCache.Values) b.Dispose();
+                _colorBrushCache.Clear();
 
                 foreach (var p in _penCache.Values) p.Dispose();
                 _penCache.Clear();
@@ -180,7 +204,7 @@ namespace LiteMonitor.src.Core
         public static void FillRoundRect(Graphics g, Rectangle r, int radius, Color c)
         {
             if (r.Width <= 0 || r.Height <= 0) return;
-            using var brush = new SolidBrush(c);
+            var brush = GetBrush(c);
             using var path = RoundRect(r, radius);
             g.FillPath(brush, path);
         }
@@ -196,11 +220,8 @@ namespace LiteMonitor.src.Core
             }
 
             // 2. Value Bar
-            // [Refactor] CachedPercent already includes visual correction (min 5%, max 100%) via MetricUtils.GetProgressValue
-            double percent = item.CachedPercent; 
-            
-            int w = (int)(item.BarRect.Width * percent);
-            if (w < 1 && percent > 0) w = 1; // 绝对防御：只要有百分比，至少画1像素
+            // 填充宽度公式放在 MetricItem 里，重绘签名与这里用同一个值
+            int w = item.GetBarFillWidth();
 
             // Color
             Color barColor = GetStateColor(item.CachedColorState, t, false);
@@ -210,8 +231,8 @@ namespace LiteMonitor.src.Core
                 Rectangle bar = new Rectangle(item.BarRect.X, item.BarRect.Y, w, item.BarRect.Height);
                 if (bar.Width > 0 && bar.Height > 0)
                 {
+                    var brush = GetBrush(barColor);
                     using (var fgPath = RoundRect(bar, bar.Height / 2))
-                    using (var brush = new SolidBrush(barColor))
                     {
                         g.FillPath(brush, fgPath);
                     }

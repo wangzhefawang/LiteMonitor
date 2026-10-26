@@ -111,7 +111,8 @@ namespace LiteMonitor
 
             // Label (左对齐)
             // ★★★ 优化：直接使用缓存的 it.Label ★★★
-            string label = string.IsNullOrEmpty(it.Label) ? it.Key : it.Label;
+            string label = it.Label; // Label getter 内部加锁查 InfoService，只读一次
+            if (string.IsNullOrEmpty(label)) label = it.Key;
 
             TextRenderer.DrawText(g, label, t.FontItem, it.LabelRect,
                 ThemeManager.ParseColor(t.Color.TextPrimary),
@@ -139,8 +140,9 @@ namespace LiteMonitor
             if (it.Bounds == Rectangle.Empty) return;
 
             // Label (居中顶部)
-            string label = string.IsNullOrEmpty(it.Label) ? it.Key : it.Label;
-            
+            string label = it.Label;
+            if (string.IsNullOrEmpty(label)) label = it.Key;
+
             TextRenderer.DrawText(g, label, t.FontItem, it.LabelRect,
                 ThemeManager.ParseColor(t.Color.TextPrimary),
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.Top | TextFormatFlags.NoPadding);
@@ -166,7 +168,8 @@ namespace LiteMonitor
             if (it.Bounds == Rectangle.Empty) return;
 
             // 1. 绘制左侧标签 (IP)
-            string label = string.IsNullOrEmpty(it.Label) ? it.Key : it.Label;
+            string label = it.Label;
+            if (string.IsNullOrEmpty(label)) label = it.Key;
             TextRenderer.DrawText(g, label, t.FontItem, it.LabelRect,
                 ThemeManager.ParseColor(t.Color.TextPrimary),
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);

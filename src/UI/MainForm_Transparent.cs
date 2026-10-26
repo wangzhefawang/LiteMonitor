@@ -209,8 +209,7 @@ namespace LiteMonitor
             // 双击
             this.DoubleClick += (_, __) => _bizHelper.HandleDoubleClick();
             
-            // DPI / Resize
-            this.Resize += (_, __) => _winHelper.ApplyRoundedCorners();
+            // DPI / Resize（Resize 时的圆角刷新已由 MainFormWinHelper 订阅，这里不再重复）
             this.VisibleChanged += (_, __) => { if (Visible) _winHelper.RefreshTopMost(_cfg.TopMost, forceReinsert: true); };
             this.HandleCreated += (_, __) => _winHelper.RefreshTopMost(_cfg.TopMost, forceReinsert: true);
         }

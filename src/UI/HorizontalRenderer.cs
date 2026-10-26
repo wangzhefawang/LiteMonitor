@@ -16,8 +16,7 @@ namespace LiteMonitor
         {
             int panelHeight = (int)g.VisibleClipBounds.Height;
 
-            using (var bg = new SolidBrush(ThemeManager.ParseColor(t.Color.Background)))
-                g.FillRectangle(bg, new Rectangle(0, 0, panelWidth, panelHeight));
+            g.FillRectangle(UIUtils.GetBrush(t.Color.Background), new Rectangle(0, 0, panelWidth, panelHeight));
 
             foreach (var col in cols)
                 DrawColumn(g, col, t);
@@ -52,7 +51,8 @@ namespace LiteMonitor
             // ★★★ 策略 A: 纯文本模式 (隐藏标签) ★★★
             // 适用于 IP、Dashboard 文本，直接居左显示
             // 逻辑：如果 ShortLabel 被显式设为空格或空，则视为隐藏标签
-            bool hideLabel = string.IsNullOrEmpty(it.ShortLabel) || it.ShortLabel == " ";
+            string shortLabel = it.ShortLabel; // 只读一次，避免重复走 getter
+            bool hideLabel = string.IsNullOrEmpty(shortLabel) || shortLabel == " ";
 
             if (hideLabel)
             {
@@ -71,7 +71,7 @@ namespace LiteMonitor
             // ★★★ 策略 B: 标准标签模式 ★★★
             // Label (左对齐)
             // 优化：直接使用缓存的 ShortLabel
-            string label = !string.IsNullOrEmpty(it.ShortLabel) ? it.ShortLabel : it.Label;
+            string label = !string.IsNullOrEmpty(shortLabel) ? shortLabel : it.Label;
             if (string.IsNullOrEmpty(label)) label = it.Key;
 
             TextRenderer.DrawText(

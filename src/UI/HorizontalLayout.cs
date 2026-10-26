@@ -300,10 +300,12 @@ namespace LiteMonitor
         }
 
         // [通用方案] 获取当前布局的签名是否变化 (用于检测是否需要重绘)
+        // 签名只覆盖 MeasureMetricItem 真正用到的输入：带标签项按短标签与样本文本测宽，数值变化不影响几何；
+        // 隐藏标签项按当前文本测宽，沿用长度加非数字字符
         public string GetLayoutSignature(List<Column> cols)
         {
             if (cols == null || cols.Count == 0) return "";
-            
+
             unchecked
             {
                 int hash = 17;
@@ -313,10 +315,28 @@ namespace LiteMonitor
                     void AddItemToHash(MetricItem? item)
                     {
                         if (item == null) return;
-                        string text = item.TextValue ?? item.GetFormattedText(true);
-                        hash = hash * 31 + text.Length;
-                        // 关键：数字位宽一致，所以只对非数字字符（单位、小数点）做哈希
-                        foreach (char c in text) if (!char.IsDigit(c)) hash = (hash << 5) - hash + c;
+
+                        // 与 MeasureMetricItem 的隐藏标签判定保持一致
+                        string shortLabel = item.ShortLabel;
+                        bool hideLabel = string.IsNullOrEmpty(shortLabel) || shortLabel == " ";
+
+                        if (hideLabel)
+                        {
+                            string text = item.TextValue ?? item.GetFormattedText(true);
+                            hash = hash * 31 + text.Length;
+                            // 关键：数字位宽一致，所以只对非数字字符（单位、小数点）做哈希
+                            foreach (char c in text) if (!char.IsDigit(c)) hash = (hash << 5) - hash + c;
+                        }
+                        else
+                        {
+                            // 带标签项的宽度只取决于短标签和样本文本；带上长度避免 "ab"+"c" 与 "a"+"bc" 撞签名
+                            hash = hash * 31 + shortLabel.Length;
+                            foreach (char c in shortLabel) hash = (hash << 5) - hash + c;
+
+                            string sample = GenerateSampleText(item);
+                            hash = hash * 31 + sample.Length;
+                            foreach (char c in sample) hash = (hash << 5) - hash + c;
+                        }
                     }
 
                     AddItemToHash(col.Top);
