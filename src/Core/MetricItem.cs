@@ -240,18 +240,9 @@ namespace LiteMonitor
             return w;
         }
 
-        // AnimationSpeed 表示每 100 ms 追上剩余差值的比例，与刷新间隔和帧率无关
-        public static double FrameAlpha(double speed, double elapsedMs)
+        public void TickSmooth(double speed)
         {
-            if (speed >= 0.9) return 1;
-            if (speed <= 0 || elapsedMs <= 0) return 0;
-            return 1 - Math.Pow(1 - speed, elapsedMs / 100.0);
-        }
-
-        // alpha 是本帧系数，由 FrameAlpha 按真实经过时间算出；返回值表示本帧之后是否仍在向目标移动
-        public bool TickSmooth(double alpha)
-        {
-            if (!Value.HasValue) return false;
+            if (!Value.HasValue) return;
             float target = Value.Value;
             float diff = Math.Abs(target - DisplayValue);
 
@@ -259,21 +250,12 @@ namespace LiteMonitor
             if (diff < 0.05f)
             {
                 DisplayValue = target;
-                return false;
+                return;
             }
 
             // 大幅跳变或高速模式直接更新
-            if (diff > 15f || alpha >= 1)
-            {
-                DisplayValue = target;
-                return false;
-            }
-
-            // 速度为 0 时显示值不跟随（与原来一致），也不算在移动，动画定时器会停下
-            if (alpha <= 0) return false;
-
-            DisplayValue += (float)((target - DisplayValue) * alpha);
-            return Math.Abs(target - DisplayValue) >= 0.05f;
+            if (diff > 15f || speed >= 0.9) DisplayValue = target;
+            else DisplayValue += (float)((target - DisplayValue) * speed);
         }
     }
 }

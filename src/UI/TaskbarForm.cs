@@ -67,7 +67,7 @@ namespace LiteMonitor
             _bizHelper.AttachToTaskbar();
             _winHelper.ApplyLayeredStyle(_bizHelper.TransparentKey, _cfg.TaskbarClickThrough);
 
-            // 巡检句柄、父窗口、任务栏矩形、位置和主题，与刷新间隔无关；重画由 UIController.FrameUpdated 驱动
+            // 巡检句柄、父窗口、任务栏矩形、位置和主题，与刷新间隔无关；重画由 UIController.DataUpdated 驱动
             _timer.Interval = 1000;
             _timer.Tick += (_, __) => Tick();
             _timer.Start();
@@ -75,7 +75,7 @@ namespace LiteMonitor
             // 鼠标悬浮提示初始化
             _tooltipHelper = new TaskbarTooltipHelper(this, _cfg, _ui);
 
-            _ui.FrameUpdated += OnFrameUpdated;
+            _ui.DataUpdated += OnDataUpdated;
 
             Tick();
         }
@@ -106,7 +106,7 @@ namespace LiteMonitor
         {
             if (disposing)
             {
-                _ui.FrameUpdated -= OnFrameUpdated;
+                _ui.DataUpdated -= OnDataUpdated;
                 _winHelper?.RestoreTaskbar();
                 _timer.Stop();
                 _timer.Dispose();
@@ -200,12 +200,12 @@ namespace LiteMonitor
             RefreshView(patrol: true);
         }
 
-        private void OnFrameUpdated(bool isDataTick)
+        private void OnDataUpdated()
         {
             RefreshView(patrol: false);
 
-            // 悬浮提示读的是数值，只在数据刷新后更新；动画帧不刷新提示框
-            if (isDataTick) _tooltipHelper.UpdateContent();
+            // 悬浮提示读的是数值，每次数据刷新后更新
+            _tooltipHelper.UpdateContent();
         }
 
         private void RefreshView(bool patrol)
@@ -218,7 +218,7 @@ namespace LiteMonitor
             
             _cols = nextCols; // 确认有效后再更新引用
 
-            // 任务栏矩形只在巡检时查，动画帧用缓存的高度
+            // 任务栏矩形只在巡检时查，数据刷新时用缓存的高度
             if (patrol) _bizHelper.UpdateTaskbarRect();
 
             bool layoutChanged = false;

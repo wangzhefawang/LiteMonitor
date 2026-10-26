@@ -16,10 +16,6 @@ namespace LiteMonitor
         private readonly HardwareMonitor _mon;
         private readonly System.Windows.Forms.Timer _timer;
 
-        // 数值动画独立于数据刷新：有项未收敛时才运行，用真实帧间隔算系数
-        private readonly System.Windows.Forms.Timer _animTimer;
-        private readonly System.Diagnostics.Stopwatch _animClock = new();
-
         private UILayout _layout;
         private bool _layoutDirty = true;
         private bool _dragging = false;
@@ -41,8 +37,8 @@ namespace LiteMonitor
         public List<Column> GetTaskbarColumns() => _hxColsTaskbar;
         public List<GroupLayoutInfo> GetMainGroups() => _groups;
 
-        // 每次数据刷新（true）和动画帧（false）收尾时在 UI 线程触发，任务栏据此重排和重绘
-        public event Action<bool>? FrameUpdated;
+        // 每次数据刷新收尾时在 UI 线程触发，任务栏据此重排、重绘并更新悬浮提示
+        public event Action? DataUpdated;
 
         public UIController(Settings cfg, Form form)
         {
@@ -55,9 +51,6 @@ namespace LiteMonitor
             _timer = new System.Windows.Forms.Timer { Interval = Math.Max(80, _cfg.RefreshMs) };
             _timer.Tick += (_, __) => Tick();
             _timer.Start();
-
-            _animTimer = new System.Windows.Forms.Timer { Interval = 33 };
-            _animTimer.Tick += (_, __) => AnimateFrame();
 
             ApplyTheme(_cfg.Skin);
         }
@@ -199,7 +192,7 @@ namespace LiteMonitor
                 // 先驱动 InfoService，下面读到的看板文本就属于本轮刷新（时钟类文本不再落后一个刷新周期）
                 InfoService.Instance.Update();
 
-                // ① 更新竖屏 items（只设目标值，平滑由动画定时器推进）
+                // ① 更新竖屏 items（每次数据刷新向目标值走一步平滑）
                 foreach (var g in _groups)
                     foreach (var it in g.Items)
                     {
@@ -211,6 +204,7 @@ namespace LiteMonitor
                         else
                         {
                             it.Value = _mon.Get(it.Key);
+                            it.TickSmooth(_cfg.AnimationSpeed);
                         }
                     }
 
@@ -229,6 +223,7 @@ namespace LiteMonitor
                         else
                         {
                             it.Value = _mon.Get(it.Key);
+                            it.TickSmooth(_cfg.AnimationSpeed);
                         }
                     }
                     UpdateItem(col.Top);
@@ -250,9 +245,8 @@ namespace LiteMonitor
 
                 CheckTemperatureAlert();
 
-                // 目标值已更新：需要时启动动画，再做布局/重绘收尾
-                StartAnimationIfNeeded();
-                FinishFrame(true);
+                // 数值已更新：做布局/重绘收尾
+                FinishFrame();
             }
             catch (Exception ex)
             {
@@ -265,72 +259,11 @@ namespace LiteMonitor
             }
         }
 
-        // 速度够高时立即吸附到目标；否则启动动画定时器，由第一帧开始推进
-        // 即使所有项已收敛也可以启动，第一帧发现没有项在动就会停掉
-        private void StartAnimationIfNeeded()
-        {
-            if (MetricItem.FrameAlpha(_cfg.AnimationSpeed, 100) >= 1)
-            {
-                StepAll(1);
-                return;
-            }
-
-            if (!_animTimer.Enabled)
-            {
-                _animClock.Restart();
-                _animTimer.Start();
-            }
-        }
-
-        private void AnimateFrame()
-        {
-            try
-            {
-                double elapsed = _animClock.Elapsed.TotalMilliseconds;
-                _animClock.Restart();
-                double alpha = MetricItem.FrameAlpha(_cfg.AnimationSpeed, elapsed);
-
-                bool moving = StepAll(alpha);
-                if (!moving) _animTimer.Stop();
-
-                FinishFrame(false);
-            }
-            catch (Exception ex)
-            {
-                _animTimer.Stop();
-                AppLog.Warn("UI.Animate", "动画帧失败", ex);
-            }
-        }
-
-        // 推进竖屏、横条、任务栏三套条目（悬浮提示读竖屏，任务栏读自己的列），DASH 项没有数值；返回是否仍有项在移动
-        private bool StepAll(double alpha)
-        {
-            bool moving = false;
-
-            foreach (var g in _groups)
-                foreach (var it in g.Items)
-                    if (it != null && !it.IsDash && it.TickSmooth(alpha)) moving = true;
-
-            foreach (var col in _hxColsHorizontal)
-            {
-                if (col.Top != null && !col.Top.IsDash && col.Top.TickSmooth(alpha)) moving = true;
-                if (col.Bottom != null && !col.Bottom.IsDash && col.Bottom.TickSmooth(alpha)) moving = true;
-            }
-
-            foreach (var col in _hxColsTaskbar)
-            {
-                if (col.Top != null && !col.Top.IsDash && col.Top.TickSmooth(alpha)) moving = true;
-                if (col.Bottom != null && !col.Bottom.IsDash && col.Bottom.TickSmooth(alpha)) moving = true;
-            }
-
-            return moving;
-        }
-
-        // 数据刷新和动画帧共用的收尾：横屏布局检查、主面板按签名决定是否重画、通知任务栏
-        private void FinishFrame(bool isDataTick)
+        // 每次数据刷新后的收尾：横屏布局检查、主面板按签名决定是否重画、通知任务栏
+        private void FinishFrame()
         {
             // 只有当充电状态、隐藏标签项文本长度等导致样本变化时，才标记 Dirty
-            // 每次数据刷新和动画帧之后都会检查
+            // 每次数据刷新之后都会检查
             if (_cfg.HorizontalMode && _hxLayout != null)
             {
                 string currentLayoutSig = _hxLayout.GetLayoutSignature(_hxColsHorizontal);
@@ -348,7 +281,7 @@ namespace LiteMonitor
                 _form.Invalidate();
             }
 
-            FrameUpdated?.Invoke(isDataTick);
+            DataUpdated?.Invoke();
         }
 
         // 签名覆盖绘制时读取的全部可变量（与 UIRenderer / HorizontalRenderer 一致），签名不变则像素不变
@@ -649,8 +582,6 @@ namespace LiteMonitor
         {
             _timer.Stop();
             _timer.Dispose();
-            _animTimer.Stop();
-            _animTimer.Dispose();
             _mon.Dispose();
         }
     }
