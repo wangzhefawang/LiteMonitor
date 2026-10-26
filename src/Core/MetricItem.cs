@@ -24,10 +24,14 @@ namespace LiteMonitor
         private string? _dashColorKey;
         private const string PluginPrefix = "DASH.";
 
-        public string Key 
-        { 
+        // 去掉 "DASH." 前缀的 InfoService 取值键，非看板项为 null；Key 赋值时算一次，避免每帧 Substring
+        public string? DashKey { get; private set; }
+        public bool IsDash => DashKey != null;
+
+        public string Key
+        {
             get => _key;
-            set 
+            set
             {
                 _key = UIUtils.Intern(value);
                 // 预计算查找键
@@ -37,12 +41,15 @@ namespace LiteMonitor
                     // 移除 "DASH." 前缀 (长度=5) 并追加 ".Color"
                     // 使用 Span 避免中间子字符串分配 (CA1845)
                     _dashColorKey = UIUtils.Intern(string.Concat(_key.AsSpan(PluginPrefix.Length), ".Color".AsSpan()));
+                    // 只在赋值时执行一次，直接用 Substring
+                    DashKey = UIUtils.Intern(_key.Substring(PluginPrefix.Length));
                 }
                 else
                 {
                     _dashColorKey = null;
+                    DashKey = null;
                 }
-            } 
+            }
         }
 
         private string _label = "";
@@ -206,7 +213,7 @@ namespace LiteMonitor
                 }
 
                 // Only calculate color if NOT a plugin item (already handled above)
-                if (!Key.StartsWith("DASH."))
+                if (!IsDash)
                 {
                     CachedColorState = MetricUtils.GetState(Key, DisplayValue);
                 }
@@ -224,22 +231,49 @@ namespace LiteMonitor
         public Rectangle BarRect;     
         public Rectangle BackRect;    
 
-        public void TickSmooth(double speed)
+        // 进度条前景的填充像素宽度；UIUtils.DrawBar 与主面板重绘签名共用，保证两处公式一致
+        public int GetBarFillWidth()
         {
-            if (!Value.HasValue) return;
+            double percent = CachedPercent;
+            int w = (int)(BarRect.Width * percent);
+            if (w < 1 && percent > 0) w = 1;
+            return w;
+        }
+
+        // AnimationSpeed 表示每 100 ms 追上剩余差值的比例，与刷新间隔和帧率无关
+        public static double FrameAlpha(double speed, double elapsedMs)
+        {
+            if (speed >= 0.9) return 1;
+            if (speed <= 0 || elapsedMs <= 0) return 0;
+            return 1 - Math.Pow(1 - speed, elapsedMs / 100.0);
+        }
+
+        // alpha 是本帧系数，由 FrameAlpha 按真实经过时间算出；返回值表示本帧之后是否仍在向目标移动
+        public bool TickSmooth(double alpha)
+        {
+            if (!Value.HasValue) return false;
             float target = Value.Value;
             float diff = Math.Abs(target - DisplayValue);
-            
+
             // ★★★ [Fix] 核心修复：微小差异直接吸附，而不是跳过 ★★★
-            if (diff < 0.05f) 
+            if (diff < 0.05f)
             {
                 DisplayValue = target;
-                return;
+                return false;
             }
 
             // 大幅跳变或高速模式直接更新
-            if (diff > 15f || speed >= 0.9) DisplayValue = target;
-            else DisplayValue += (float)((target - DisplayValue) * speed);
+            if (diff > 15f || alpha >= 1)
+            {
+                DisplayValue = target;
+                return false;
+            }
+
+            // 速度为 0 时显示值不跟随（与原来一致），也不算在移动，动画定时器会停下
+            if (alpha <= 0) return false;
+
+            DisplayValue += (float)((target - DisplayValue) * alpha);
+            return Math.Abs(target - DisplayValue) >= 0.05f;
         }
     }
 }
