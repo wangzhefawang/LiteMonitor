@@ -2,7 +2,6 @@ using System.Collections.Concurrent;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
-using System.Text.RegularExpressions;
 using System.Text.Json;
 using System.Buffers;
 using System.Diagnostics;
@@ -60,6 +59,7 @@ namespace LiteMonitor.src.WebServer
             try
             {
                 var stream = client.GetStream();
+                stream.WriteTimeout = 5000;
 
                 // 1. 读取请求头 (最多 8KB，5 秒内没读完就放弃，防恶意连接)
                 buffer = ArrayPool<byte>.Shared.Rent(8192);
@@ -97,6 +97,8 @@ namespace LiteMonitor.src.WebServer
             finally
             {
                 if (buffer != null) ArrayPool<byte>.Shared.Return(buffer);
+                // 接收循环结束或握手失败时，都释放此连接。
+                try { client.Close(); } catch { }
                 _connSlots.Release(); // 与方法开头的 Wait(0) 成对，只释放一次
             }
         }
@@ -108,20 +110,19 @@ namespace LiteMonitor.src.WebServer
             // NetworkStream.ReadTimeout 对 ReadAsync 无效，用链接 token 实现整个请求头的 5 秒总超时
             using var readCts = CancellationTokenSource.CreateLinkedTokenSource(serviceToken);
             readCts.CancelAfter(HeaderReadTimeoutMs);
+            int maxHeaderBytes = Math.Min(8192, buffer.Length);
 
             int totalBytes = 0;
-            while (totalBytes < buffer.Length)
+            while (totalBytes < maxHeaderBytes)
             {
-                // 预留空间检查
-                if (totalBytes >= buffer.Length) break;
-
-                int read = await stream.ReadAsync(buffer.AsMemory(totalBytes, buffer.Length - totalBytes), readCts.Token);
-                if (read == 0) break;
+                int read = await stream.ReadAsync(buffer.AsMemory(totalBytes, maxHeaderBytes - totalBytes), readCts.Token);
+                if (read == 0) return 0;
                 
                 totalBytes += read;
                 if (FindHeaderEnd(buffer, totalBytes) >= 0) return totalBytes;
             }
-            return totalBytes;
+            // 超出上限或未收到完整结束符时，不处理任何 HTTP 或 WebSocket 请求。
+            return 0;
         }
 
         private int FindHeaderEnd(byte[] buffer, int length)
@@ -136,8 +137,36 @@ namespace LiteMonitor.src.WebServer
 
         private bool IsWebSocketUpgrade(string req)
         {
-            return Regex.IsMatch(req, "GET", RegexOptions.IgnoreCase) && 
-                   Regex.IsMatch(req, "Upgrade: websocket", RegexOptions.IgnoreCase);
+            return req.StartsWith("GET ", StringComparison.OrdinalIgnoreCase) &&
+                   TryGetHeaderValue(req, "Upgrade", out var upgrade) &&
+                   upgrade.Equals("websocket", StringComparison.OrdinalIgnoreCase);
+        }
+
+        // 只读取完整请求头中的独立字段，忽略头名大小写及值两侧的空格、制表符。
+        private static bool TryGetHeaderValue(string request, string name, out string value)
+        {
+            value = "";
+            int headerEnd = request.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+            int lineStart = request.IndexOf("\r\n", StringComparison.Ordinal);
+            if (headerEnd < 0 || lineStart < 0) return false;
+
+            bool found = false;
+            lineStart += 2;
+            while (lineStart < headerEnd)
+            {
+                int lineEnd = request.IndexOf("\r\n", lineStart, StringComparison.Ordinal);
+                string line = request.Substring(lineStart, lineEnd - lineStart);
+                int colon = line.IndexOf(':');
+                if (colon > 0 && line.Substring(0, colon).Equals(name, StringComparison.OrdinalIgnoreCase))
+                {
+                    // 拒绝重复字段，避免握手时产生歧义。
+                    if (found) return false;
+                    value = line.Substring(colon + 1).Trim(' ', '\t');
+                    found = true;
+                }
+                lineStart = lineEnd + 2;
+            }
+            return found;
         }
 
         private void HandleHttpRequest(NetworkStream stream, string request)
@@ -185,13 +214,22 @@ namespace LiteMonitor.src.WebServer
             var pwd = Settings.Load().WebServerPassword;
             if (string.IsNullOrEmpty(pwd)) return true;
 
-            var firstLine = requestHeader.Split('\n')[0]; 
-            var match = Regex.Match(firstLine, @"[?&]pwd=([^&\s]+)");
-            if (match.Success)
+            string firstLine = requestHeader.Split('\n')[0];
+            string[] parts = firstLine.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 2) return false;
+            int queryStart = parts[1].IndexOf('?');
+            if (queryStart < 0) return false;
+
+            string? suppliedPassword = null;
+            foreach (string parameter in parts[1].Substring(queryStart + 1).Split('&'))
             {
-                return match.Groups[1].Value == pwd;
+                int equals = parameter.IndexOf('=');
+                if (equals < 0 || parameter.Substring(0, equals) != "pwd") continue;
+                // 浏览器使用 encodeURIComponent 编码密码；拒绝重复参数，避免认证歧义。
+                if (suppliedPassword != null) return false;
+                suppliedPassword = System.Net.WebUtility.UrlDecode(parameter.Substring(equals + 1));
             }
-            return false;
+            return suppliedPassword == pwd;
         }
 
         private void SendHttpResponse(NetworkStream stream, int code, string type, byte[] body, int len)
@@ -369,15 +407,13 @@ namespace LiteMonitor.src.WebServer
                     return false;
                 }
 
-                // 1. 提取 Sec-WebSocket-Key
-                var match = Regex.Match(request, "Sec-WebSocket-Key: (.*)");
-                if (!match.Success) return false;
-
-                string key = match.Groups[1].Value.Trim();
+                // 1. 提取并校验握手键，标准要求其为 16 字节随机值的 Base64 编码。
+                if (!TryGetHeaderValue(request, "Sec-WebSocket-Key", out var key)) return false;
+                if (Convert.FromBase64String(key).Length != 16) return false;
 
                 // 2. 生成 Accept Key (Magic String: 258EAFA5-E914-47DA-95CA-C5AB0DC85B11)
                 string magic = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-                byte[] hash = SHA1.Create().ComputeHash(Encoding.UTF8.GetBytes(magic));
+                byte[] hash = SHA1.HashData(Encoding.UTF8.GetBytes(magic));
                 string acceptKey = Convert.ToBase64String(hash);
 
                 // 3. 发送握手响应
